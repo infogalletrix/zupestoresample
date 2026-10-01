@@ -125,6 +125,8 @@ test('Shiprocket pagination and split-package import do not collect COD prematur
   let orderPages = 0;
   const service = createIntegrationService(db, crypto, async (url) => {
     if (url.endsWith('/auth/login')) return response({ token: 'test' });
+    if (url.includes('/ndr/all'))
+      return response({ data: [{ awb_code: 'A3', reason: 'Customer unavailable', attempts: 2 }] });
     orderPages++;
     const page = new URL(url).searchParams.get('page');
     return response({
@@ -154,6 +156,7 @@ test('Shiprocket pagination and split-package import do not collect COD prematur
   const data = workspace(db);
   assert.equal(data.orders.find((o) => o.number === '#1001').status, 'Shipped');
   assert.equal(data.orders.find((o) => o.number === '#1002').status, 'NDR');
+  assert.match(data.shipments.find((s) => s.awb === 'A3').ndr, /Customer unavailable.*2 attempt/);
   assert.equal(data.metrics.codCollected, 0);
   assert.equal(data.metrics.codRemitted, 0);
   db.close();
@@ -165,6 +168,44 @@ test('unknown shipping cost is flagged, never silently represented as verified z
   normalizeShopify(db, remote);
   assert.equal(workspace(db).metrics.missingCosts, 1);
   db.close();
+});
+
+test('Shopify order edits remove obsolete lines and preserve supplier-settled quantities', () => {
+  const db = openDb(':memory:');
+  try {
+    const o = baseOrder();
+    normalizeShopify(db, o);
+    o.updatedAt = now();
+    o.lineItems.nodes = [
+      { ...o.lineItems.nodes[0], quantity: 0 },
+      { ...baseOrder(2).lineItems.nodes[0], quantity: 2 },
+    ];
+    const orderId = normalizeShopify(db, o);
+    assert.equal(db.prepare('SELECT COUNT(*) n FROM order_items').get().n, 1);
+    assert.equal(db.prepare('SELECT quantity FROM order_items').get().quantity, 2);
+    insert(db, 'suppliers', { id: 'locked-supplier', name: 'Supplier A', created_at: now() });
+    db.prepare('UPDATE order_items SET supplier_id=?,cost=1000').run('locked-supplier');
+    recordPayment(
+      db,
+      {
+        order_id: orderId,
+        supplier_id: 'locked-supplier',
+        date: today(),
+        kind: 'Supplier payment',
+        amount: 1000,
+        status: 'Completed',
+        reference: 'LOCK',
+        idempotency_key: id(),
+      },
+      'owner',
+    );
+    o.updatedAt = now();
+    o.lineItems.nodes[1].quantity = 1;
+    assert.throws(() => normalizeShopify(db, o), /supplier settlement/);
+    assert.equal(db.prepare('SELECT quantity FROM order_items').get().quantity, 2);
+  } finally {
+    db.close();
+  }
 });
 test('Shopify partial refunds use the adjusted tax amount and deduplicate refund transactions', () => {
   const db = openDb(':memory:');

@@ -72,6 +72,7 @@ export type Order = {
   items: Item[];
   shipments: Shipment[];
   product_cost: number;
+  payment_fees?: number;
   credit_received: number;
   credit_used: number;
   payable: number;
@@ -96,6 +97,10 @@ export type Expense = {
   reference: string;
 };
 export type Payment = {
+  bank_amount?: number | null;
+  fee_amount?: number;
+  shipping_deduction?: number;
+  rto_deduction?: number;
   id: string;
   order_id: string;
   supplier_id: string | null;
@@ -152,8 +157,18 @@ export type SyncRun = {
   finished_at: string;
 };
 export type Workspace = {
+  operations?: {
+    remittancesToReview: number;
+    webhookFailures: number;
+    syncIssues: number;
+    backupFailed: boolean;
+  };
   connections?: Integration[];
-  paymentMetrics?: Pick<Metrics, 'codCollected' | 'codRemitted' | 'codPending' | 'prepaid'>;
+  paymentMetrics?: Pick<Metrics, 'codCollected' | 'codRemitted' | 'codPending' | 'prepaid'> & {
+    bankReceived?: number;
+    bankUnverified?: number;
+    deductions?: number;
+  };
   business: { name: string; currency: string; timezone: string };
   orders: Order[];
   products: Product[];
@@ -194,6 +209,13 @@ export type Integration = {
 };
 export type User = { id: string; name: string; email: string; role: string; active: number };
 export type SettingsData = {
+  backupStatus?: {
+    status?: string;
+    lastSuccess?: string;
+    message?: string;
+    intervalHours: number;
+    retentionDays: number;
+  } | null;
   business: { name: string };
   integrations: Integration[];
   users: User[];

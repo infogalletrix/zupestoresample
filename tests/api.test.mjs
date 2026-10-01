@@ -37,6 +37,93 @@ async function owner(app) {
   return agent;
 }
 
+test('remittance upload preview is read-only, posting is idempotent and automation credentials are admin-only', async (t) => {
+  const { app, db, reports } = fixture(t),
+    admin = await owner(app);
+  insert(db, 'products', {
+    id: 'report-product',
+    name: 'Test product',
+    sku: 'REPORT-TEST',
+    cost: 50000,
+    price: 100000,
+    stock: 10,
+  });
+  const order = createOrder(
+    db,
+    {
+      date: today(),
+      customer: 'Report buyer',
+      method: 'COD',
+      status: 'Delivered',
+      items: [{ product_id: 'report-product', quantity: 1, price: 100000 }],
+    },
+    'owner',
+  );
+  const csv = `Order ID,UTR,Remittance Date,COD Amount,Payment Status\n${order.number},REPORT-UTR,${today()},1000,Remitted`;
+  const body = {
+    filename: 'report.csv',
+    content: Buffer.from(csv).toString('base64'),
+    mapping: {},
+  };
+  await request(app).post('/api/remittances/import').set(header).send(body).expect(401);
+  const preview = await admin.post('/api/remittances/import').set(header).send(body).expect(200);
+  assert.equal(preview.body.totals.Ready, 1);
+  assert.equal(
+    db.prepare("SELECT COUNT(*) n FROM payments WHERE kind='COD remittance'").get().n,
+    0,
+  );
+  const posted = await admin
+    .post('/api/remittances/import')
+    .set(header)
+    .send({ ...body, preview: false })
+    .expect(200);
+  assert.equal(posted.body.posted, 1);
+  assert.equal(
+    (
+      await admin
+        .post('/api/remittances/import')
+        .set(header)
+        .send({ ...body, preview: false })
+        .expect(200)
+    ).body.duplicate,
+    1,
+  );
+  const config = await admin
+    .post('/api/remittances/config')
+    .set(header)
+    .send({ enabled: true })
+    .expect(200);
+  assert.match(config.body.webhookUrl, /remittance-report\/[a-f0-9]{64}$/);
+  await request(app)
+    .post(new URL(config.body.webhookUrl).pathname)
+    .set('Content-Type', 'text/csv')
+    .send(csv)
+    .expect(202);
+  await reports.process();
+  const exported = await admin.get('/api/export/settlements?format=csv').expect(200);
+  assert.match(exported.text, /REPORT-UTR/);
+  await admin
+    .post('/api/users')
+    .set(header)
+    .send({
+      name: 'Report viewer',
+      email: 'report-viewer@example.com',
+      password: 'A secure viewer password',
+      role: 'viewer',
+    })
+    .expect(201);
+  const viewer = request.agent(app);
+  await viewer
+    .post('/api/auth/login')
+    .set(header)
+    .send({ email: 'report-viewer@example.com', password: 'A secure viewer password' })
+    .expect(200);
+  await viewer.get('/api/remittances').expect(200);
+  await viewer.get('/api/remittances/config').expect(403);
+  await viewer.post('/api/remittances/import').set(header).send(body).expect(403);
+  await viewer.get('/api/backup/full').expect(403);
+});
+
 test('first-owner setup, secure cookies, authentication, and logout', async (t) => {
   const { app } = fixture(t);
   await request(app).get('/api/workspace').expect(401);

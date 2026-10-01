@@ -2,6 +2,15 @@
 
 A working local commerce operations application built in this folder from the supplied requirements and dashboard reference. React + TypeScript, Express, and SQLite. Amounts are stored as integer paise. Fonts and application assets are served locally.
 
+## Version 1.2: remittance automation and operational reliability
+
+- Direct receiver for scheduled Shiprocket remittance reports, with a private rotatable webhook URL, persistent queue and retries.
+- CSV/XLSX report preview, configurable column mapping, matching by AWB/order, duplicate protection and an unresolved-payment worklist.
+- Separate gross COD cleared, reported bank receipts, fees and courier deductions. Missing bank values stay unknown; supplier credit never enters these totals.
+- Settlement fees flow through order/product profit and P&L exactly once. Cumulative courier deductions cannot exceed recorded costs.
+- Daily verified recovery ZIPs, 14-day retention, encryption key, restore instructions and cleared backup sessions. The restore test verifies records and decrypts a saved connection.
+- Detailed NDR reasons, original delivery dates, exponential webhook retries and protection against Shopify quantity edits after supplier settlement.
+
 ## Version 1.1: daily operations
 
 - Locally served Inter typography, improved contrast, larger controls, mobile quick navigation and dark mode.
@@ -68,7 +77,7 @@ The test suite covers the supplied example: receive ₹500, apply ₹300, retain
 - **Product cost:** the cost snapshot captured for the order, recognized for dispatched/delivered/NDR/RTO orders. Confirmed and cancelled orders do not recognize product cost.
 - **RTO recovery:** approved supplier credits recover the returned order's product cost once. Later spending that credit has no second profit effect.
 - **Gross profit:** recognized revenue minus net product costs, shipping, and RTO charges.
-- **Net profit:** gross profit minus manual expenses, including Meta Ads.
+- **Net profit:** gross profit minus manual expenses (including Meta Ads) and recorded settlement fees. Fees also reduce the matching order/product contribution exactly once.
 - **Order net profit:** order contribution minus an equal allocation of manual expenses in the selected period. Remainder paise are allocated deterministically, so order totals reconcile to the period P&L whenever the period contains orders.
 - **Product contribution:** allocated order revenue minus each item's historical product cost and allocated shipping/return charges, plus the item's supplier-specific RTO recovery. Shared amounts use selling values and largest-remainder allocation so paise reconcile exactly; zero-priced lines share equally. A supplier's recovery is allocated only to that supplier's items, by cost. This excludes shared period overhead.
 - **COD pending:** collected COD minus completed remittances. Delivery alone never marks a remittance complete. Pending payment records reserve payable but do not count as completed receipts.
@@ -77,7 +86,7 @@ The test suite covers the supplied example: receive ₹500, apply ₹300, retain
 - Payment ledger filters and its collected/remitted/prepaid cards use **payment dates**. The Payments page's COD pending card shows the outstanding balance **across all dates**. Dashboard payment metrics retain the selected order cohort. Supplier credit summary balances are **all time**, even when ledger/chart activity is filtered.
 - Unknown costs are flagged as provisional. Review imported supplier assignments, costs, shipping invoices and RTO charges before relying on profit. A missing shipping cost is not treated as a verified free shipment.
 - Manual expenses are **additional** costs. Do not re-enter product/shipping costs already recorded against an order. Do not add customer collection and remittance figures together as cash income.
-- Remittance amounts represent the **gross order balance cleared**. If a provider deducts already-recorded freight or fees from bank settlement, reconcile the deductions and allocate the gross cleared order amount; this version does not calculate a bank balance or import bank statements.
+- Remittance amounts represent the **gross order balance cleared**. If a provider deducts already-recorded freight or fees from bank settlement, reconcile the deductions and allocate the gross cleared order amount; report imports store the actual bank amount and explicit deductions separately. Missing bank amounts remain unknown. This version does not calculate a bank balance or import bank statements.
 
 ## Shopify connection
 
@@ -118,11 +127,25 @@ Set the same token in the Shiprocket webhook configuration. The endpoint verifie
 
 Shipping cost is imported only when the response supplies an actual `freight_charges` value for each shipment. The customer-facing `shipping_charges` field is not assumed to be your courier expense. Otherwise, confirm the invoice amount in the order's cost editor. A manual confirmed shipping cost takes precedence over subsequent status syncs. Record RTO charges from the supplier/courier invoice.
 
-### COD remittance: remaining account-specific integration
+### Automatic COD remittance reports
 
-**Direct automatic Shiprocket bank-remittance import is not implemented or claimed.** The public documentation consulted did not establish a stable order-level remittance contract. Shipping status and prepaid payment state are not proof of bank settlement.
+Shiprocket supports [scheduled report delivery by webhook](https://support.shiprocket.in/support/solutions/articles/152000000845-where-can-i-receive-my-scheduled-reports-) and provides a [remittance report for COD collections](https://support.shiprocket.in/support/solutions/articles/152000000846-how-do-i-determine-which-report-to-schedule-). Zupestore now receives these reports directly. It does not infer a bank payout from a delivery event or wallet statement.
 
-The application includes an implemented **signed settlement feed** for an authorized provider/middleware to push verified order-level remittances. Without that upstream feed, record COD remittances manually. Connecting and validating your account-specific remittance feed is still required for fully automatic COD settlement tracking.
+1. Open **Settings | Remittance automation**, enable processing and save to generate a private webhook URL.
+2. In Shiprocket **Tools | Reports**, schedule a Remittance Report with webhook delivery to that URL. Use a daily schedule and overlapping reporting periods.
+3. Preview a sample in **Payments | Reconciliation | Import report**. Verify column names and the date format, then save any mappings in automation settings. Values in reports are INR, unlike the signed feed below which uses paise.
+4. When reports contain download links, add their exact public HTTPS hostnames to the approved-host list. Every redirect is revalidated; private network downloads are rejected. No additional middleware is needed for the accepted report envelopes.
+5. Completed rows with an order/AWB, date, UTR and balanced amounts post automatically. Unmatched, pending, conflicting, overpaid or unclassified rows stay visible for review. Review rows are retried as orders synchronize. A duplicate report cannot create a second payment. The last 1,000 rows appear in the worklist; CSV/Excel exports include all matching rows.
+
+Accepted deliveries: raw CSV, raw XLSX, a JSON array of named-column rows, `{ "rows": [...] }`, `{ "data": [...] }`, `{ "csv": "..." }`, or a JSON object with `report_url`, `download_url` or `url` (also supported under `data`). Maximum report size is 8 MB / 10,000 rows. Legacy XLS files must be converted to CSV/XLSX. Report status must explicitly confirm remittance; an administrator can instead confirm that a report without a status column contains completed payments only. Column aliases are in `server/settlements.mjs` and can be overridden in the interface.
+
+Gross cleared COD equals the bank receipt plus disclosed deductions. Fees reduce profit once. Shipping/RTO deductions clear costs already recorded against the order and do not create those costs again. If no bank amount is supplied, it remains unknown and is excluded from reported-bank totals. Other deductions/wallet transfers require review. Advance payouts wait for confirmed collection and are not represented as delivery revenue. This is order-level reconciliation, not a bank-statement integration or general ledger.
+
+The native report receiver, download protections, retries, parsing and financial posting are covered by contract/API/browser tests. **Client account activation still requires the client's Shopify/Shiprocket credentials and scheduling an actual Shiprocket report. A real account report has not been supplied for live acceptance testing.** The accepted envelope and column mapping must be verified against that first report; an unknown format fails visibly without posting a payment.
+
+### Optional signed settlement feed
+
+The existing signed feed remains available for a provider or middleware that already emits verified order-level settlements:
 
 Configure a random signing secret of at least 24 characters under **Remittance feed**. Post JSON to `/api/webhooks/settlements`:
 
@@ -156,7 +179,7 @@ const signature = createHmac('sha256', signingSecret)
   .digest('hex');
 ```
 
-The timestamp must be within five minutes. Retried deliveries with the same `event_id` and identical payment are idempotent. Different data under the same event ID is rejected. For unmatched orders, retry after the order sync. A statement-specific reader, OAuth token renewal flow, and live provider credentials have not been supplied or tested against your accounts.
+The timestamp must be within five minutes. Retried deliveries with the same `event_id` and identical payment are idempotent. Different data under the same event ID is rejected. For unmatched orders, retry after the order sync. Native CSV/XLSX report ingestion is available separately as described above. Live provider credentials have not yet been supplied for account acceptance testing.
 
 ## Security, roles, backups and hosting
 
@@ -164,7 +187,7 @@ The timestamp must be within five minutes. Retried deliveries with the same `eve
 - Mutations require a same-origin verification header and allowed origin. Auth routes are rate limited. Server-side role checks apply to every protected operation.
 - Admin: all operations and settings. Manager: daily operations and exports. Viewer: read/export only. Admins cannot disable/demote themselves; another administrator can reset a user's password. There is no email password-reset service in this local version.
 - Credentials: AES-256-GCM encrypted in SQLite. The key is read from `ENCRYPTION_KEY` or generated at `data/.encryption-key`. Never publish this directory or key.
-- **Backup:** Settings → Backup & export creates a consistent SQLite backup. Store the encryption key separately; saved connections cannot be decrypted without it. A full backup contains user and session records as well as encrypted configuration.
+- **Backup:** Settings → Backup & export offers a database snapshot and a full recovery ZIP. Daily automatic ZIPs are retained for 14 days. ZIPs include the consistent database, encryption key, SHA-256 manifest and restore instructions; saved sessions are cleared in the recovery copy. Each snapshot passes SQLite integrity/foreign-key checks. Status is visible in Settings. Store a private copy off-server; same-server retention does not protect against losing the VPS.
 - **Restore:** stop the server; preserve the existing entire `data` directory; restore the chosen database backup as `data/commerce.sqlite` into a fresh data directory, with the matching key file or environment key. Start with `DATA_DIR` pointing to that directory. Do not overwrite a live SQLite database or mix old WAL files with a restored database. Restoring a backup also restores its saved users/configuration; clear restored sessions through a controlled administration process if they should not remain valid.
 
 For hosted use, build the app and run one server process with a persistent local database volume, a trusted HTTPS reverse proxy, `APP_ORIGIN=https://YOUR-DOMAIN`, `COOKIE_SECURE=true`, and `NODE_ENV=production`. Protect first-owner setup with a strong `SETUP_TOKEN` until the account exists. The `Dockerfile` builds the same application. The default host binding is loopback to keep local development private.

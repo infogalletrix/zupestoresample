@@ -502,6 +502,17 @@ export function ModalForms({ data, modal, close, done, canWrite }: FormProps) {
                   kind: paymentKind,
                   amount: toPaise(f.get('amount')),
                   tax_amount: paymentKind === 'Customer refund' ? toPaise(f.get('tax_amount')) : 0,
+                  bank_amount:
+                    paymentKind === 'COD remittance' &&
+                    f.get('bank_amount') !== '' &&
+                    f.get('bank_amount') !== null
+                      ? toPaise(f.get('bank_amount'))
+                      : null,
+                  fee_amount: paymentKind === 'COD remittance' ? toPaise(f.get('fee_amount')) : 0,
+                  shipping_deduction:
+                    paymentKind === 'COD remittance' ? toPaise(f.get('shipping_deduction')) : 0,
+                  rto_deduction:
+                    paymentKind === 'COD remittance' ? toPaise(f.get('rto_deduction')) : 0,
                   status: f.get('status'),
                   reference: f.get('reference'),
                   idempotency_key: key,
@@ -630,6 +641,28 @@ export function ModalForms({ data, modal, close, done, canWrite }: FormProps) {
             payments and refunds on Shopify orders must be recorded in Shopify; they synchronize
             automatically.
           </Notice>
+          {paymentKind === 'COD remittance' && (
+            <details className="payment-bank-details">
+              <summary>Bank receipt and deductions (optional)</summary>
+              <Notice>
+                The payment amount above is gross COD cleared. Enter the actual bank receipt and any
+                deductions below. Fees reduce profit once; shipping and RTO deductions settle costs
+                already recorded on the order.
+              </Notice>
+              <div className="form-grid">
+                {[
+                  ['bank_amount', 'Amount received in bank (₹)'],
+                  ['fee_amount', 'Settlement fees (₹)'],
+                  ['shipping_deduction', 'Shipping deducted (₹)'],
+                  ['rto_deduction', 'RTO charges deducted (₹)'],
+                ].map(([name, label]) => (
+                  <Field key={name} label={label}>
+                    <input name={name} type="number" min="0" step="0.01" placeholder="0.00" />
+                  </Field>
+                ))}
+              </div>
+            </details>
+          )}
           <Submit busy={busy} close={close} label="Record payment" />
         </form>
       </Dialog>
@@ -1024,6 +1057,8 @@ export function ModalForms({ data, modal, close, done, canWrite }: FormProps) {
             <dd>{money(o.product_cost)}</dd>
             <dt>Shipping + RTO charges</dt>
             <dd>{money(o.shipping_cost + o.rto_cost)}</dd>
+            <dt>Settlement fees</dt>
+            <dd>{money(o.payment_fees || 0)}</dd>
             <dt>RTO cost recovered</dt>
             <dd>{money(o.credit_received)}</dd>
             <dt>Allocated period expenses</dt>

@@ -5693,3 +5693,124 @@ textarea {
     background: var(--surface);
   }
 }
+
+/* Remittance reports: readable forms and horizontal tables on small screens. */
+.report-config,
+.report-upload,
+.remittance-workspace {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  min-width: 0;
+  gap: 18px;
+}
+.remittance-workspace > *,
+.report-upload > *,
+.report-config > * {
+  min-width: 0;
+}
+.report-config,
+.remittance-workspace {
+  padding: 24px;
+}
+.report-upload {
+  padding: 22px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--bg);
+}
+.report-toolbar,
+.report-buttons,
+.report-state,
+.report-endpoint {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+.report-toolbar {
+  justify-content: space-between;
+}
+.report-toolbar h3,
+.report-upload h3 {
+  margin: 0 0 6px;
+}
+.report-toolbar p,
+.report-explanation {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.7;
+  margin: 0;
+}
+.report-endpoint .form-field {
+  flex: 1;
+  min-width: 220px;
+}
+.report-config .setup-steps {
+  display: block;
+  padding-left: 22px;
+  margin: 0;
+  line-height: 1.9;
+}
+.report-mapping {
+  margin: 18px 0;
+}
+.report-config details summary {
+  cursor: pointer;
+  font-weight: 600;
+  padding: 10px 0;
+}
+.report-config > .button {
+  justify-self: start;
+}
+.settlement-summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px;
+  margin: 18px 0;
+}
+.settlement-summary > div {
+  display: grid;
+  gap: 8px;
+  padding: 18px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+}
+.settlement-summary span {
+  color: var(--muted);
+  font-size: 12px;
+}
+.settlement-summary strong {
+  font-size: 22px;
+  font-variant-numeric: tabular-nums;
+}
+.text-link {
+  border: none;
+  background: transparent;
+  color: var(--primary);
+  padding: 0;
+  font: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+@media (max-width: 650px) {
+  .settlement-summary {
+    grid-template-columns: 1fr;
+    gap: 8px;
+  }
+  .settlement-summary > div {
+    grid-template-columns: 1fr auto;
+    align-items: center;
+  }
+  .remittance-workspace,
+  .report-config,
+  .report-upload {
+    padding: 14px;
+  }
+  .report-buttons {
+    width: 100%;
+  }
+  .report-buttons .button {
+    flex: 1;
+  }
+}

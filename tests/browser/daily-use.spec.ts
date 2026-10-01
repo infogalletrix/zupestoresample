@@ -121,5 +121,31 @@ test('daily workflows, responsive screens, search, dates, payments and theme', a
     await page.keyboard.press('Escape');
     await expect(page.locator('.sidebar')).not.toHaveClass(/open/);
   }
+  await page.evaluate(() => {
+    location.hash = '#/payments';
+  });
+  await page.locator('.tabs').getByRole('button', { name: 'Reconciliation', exact: true }).click();
+  await page.getByRole('button', { name: 'Import report', exact: true }).click();
+  const ref = `REPORT-${info.project.name}-${Date.now()}`;
+  const csv = `Order ID,UTR,Remittance Date,COD Amount,Payment Status\n${order.number},${ref},${date},0.01,Remitted`;
+  await page
+    .locator('input[type=file]')
+    .setInputFiles({ name: 'remittances.csv', mimeType: 'text/csv', buffer: Buffer.from(csv) });
+  await page.getByRole('button', { name: 'Preview and validate', exact: true }).click();
+  await expect(page.getByText('1 ready.', { exact: false })).toBeVisible();
+  await page.getByRole('button', { name: 'Import 1 rows', exact: true }).click();
+  await expect(page.getByText('1 payments posted', { exact: false })).toBeVisible();
+  await expect(page.locator('tbody tr').filter({ hasText: ref })).toContainText('Posted');
+  await page.locator('.report-toolbar').scrollIntoViewIfNeeded();
+  const reportLayout = await page.locator('.report-toolbar').evaluate((el) => {
+    const r = el.getBoundingClientRect();
+    return { left: r.left, right: r.right, width: innerWidth };
+  });
+  expect(reportLayout.left).toBeGreaterThanOrEqual(0);
+  expect(reportLayout.right).toBeLessThanOrEqual(reportLayout.width);
+  await expect
+    .poll(() => page.evaluate(() => document.documentElement.scrollWidth <= innerWidth))
+    .toBeTruthy();
+  await page.screenshot({ path: `${folder}/reconciliation.png` });
   expect(errors).toEqual([]);
 });

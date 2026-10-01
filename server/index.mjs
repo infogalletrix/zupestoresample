@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import { createApp } from './app.mjs';
-const { app, db, demoDb, integrations } = createApp();
+const { app, db, demoDb, integrations, reports, backups } = createApp();
 const port = Number(process.env.PORT || 3001),
   host = process.env.HOST || '127.0.0.1';
 const server = app.listen(port, host, () =>
@@ -20,20 +20,34 @@ async function poll() {
       }
     }
   } finally {
+    await reports.process().catch((e) => console.error(`Remittance reports: ${e.message}`));
     pollRunning = false;
   }
 }
 const minutes = Math.max(5, Number(process.env.SYNC_INTERVAL_MINUTES) || 15);
 const syncTimer = setInterval(poll, minutes * 60000);
 const workerTimer = setInterval(
-  () => integrations.processWebhooks().catch((e) => console.error(e.message)),
+  () =>
+    Promise.all([integrations.processWebhooks(), reports.process()]).catch((e) =>
+      console.error(e.message),
+    ),
   30000,
 );
 const startupTimer = setTimeout(poll, 5000);
+const backupTimer = setInterval(
+  () => backups.scheduled().catch((e) => console.error(`Backup: ${e.message}`)),
+  3600000,
+);
+const initialBackup = setTimeout(
+  () => backups.scheduled().catch((e) => console.error(`Backup: ${e.message}`)),
+  10000,
+);
 function shutdown() {
   clearInterval(syncTimer);
   clearInterval(workerTimer);
   clearTimeout(startupTimer);
+  clearInterval(backupTimer);
+  clearTimeout(initialBackup);
   server.close(() => {
     db.close();
     demoDb.close();

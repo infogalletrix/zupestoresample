@@ -15,10 +15,19 @@ export function indiaDate(value) {
         day: '2-digit',
       }).format(d);
 }
+export function shipmentTimestamp(value, fallback = now()) {
+  if (!value || String(value).startsWith('0000')) return fallback;
+  let s = String(value).trim().replace(' ', 'T');
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) s += 'T00:00:00';
+  if (!/Z$|[+-]\d{2}:\d{2}$/.test(s)) s += '+05:30';
+  const parsed = new Date(s);
+  return Number.isNaN(parsed.getTime()) ? fallback : parsed.toISOString();
+}
 export function mapShipmentStatus(value) {
   const s = String(value || '')
     .toUpperCase()
     .replaceAll('_', ' ');
+  if (/^\d+$/.test(s)) return statusCodes[Number(s)] || 'Confirmed';
   if (/RTO|RETURN TO ORIGIN|RETURNED TO ORIGIN/.test(s)) return 'RTO';
   if (/UNDELIVERED|NDR|UNDELIVERABLE|DELIVERY FAILED|DELIVERY ATTEMPT|DELIVERY EXCEPTION/.test(s))
     return 'NDR';
@@ -119,7 +128,29 @@ export function normalizeShopify(db, order) {
           .join(',')} WHERE id=?`,
       ).run(...Object.values(values), orderId);
     else insert(db, 'orders', { id: orderId, external_id: order.id, ...values });
+    const incoming = new Map(
+      (order.lineItems?.nodes || []).filter((l) => l.quantity > 0).map((l) => [l.id, l]),
+    );
+    const locked =
+      old &&
+      (db.prepare('SELECT id FROM credit_ledger WHERE order_id=? LIMIT 1').get(orderId) ||
+        db
+          .prepare(
+            "SELECT id FROM payments WHERE order_id=? AND kind='Supplier payment' AND voided_at IS NULL LIMIT 1",
+          )
+          .get(orderId));
+    for (const line of db.prepare('SELECT * FROM order_items WHERE order_id=?').all(orderId)) {
+      const updated = incoming.get(line.external_id);
+      if (locked && (!updated || updated.quantity !== line.quantity))
+        throw new AppError(
+          `Order ${order.name} changed after supplier settlement. Review the supplier ledger before changing its quantities.`,
+        );
+      if (!updated) db.prepare('DELETE FROM order_items WHERE id=?').run(line.id);
+    }
     for (const line of order.lineItems?.nodes || []) {
+      if (line.quantity === 0) continue;
+      if (!Number.isSafeInteger(line.quantity) || line.quantity < 0)
+        throw new AppError(`Order ${order.name} has an invalid quantity.`);
       const prior = db
         .prepare('SELECT * FROM order_items WHERE order_id=? AND external_id=?')
         .get(orderId, line.id);
@@ -442,6 +473,12 @@ export function createIntegrationService(db, crypto, fetcher = fetch) {
       const d = await shipGet(`/orders?${params}`);
       if (!Array.isArray(d.data)) throw new AppError('Unexpected Shiprocket order response.', 502);
       for (const remote of d.data) {
+        if (
+          c.channelId &&
+          remote.channel_id !== undefined &&
+          String(remote.channel_id) !== c.channelId
+        )
+          continue;
         const number = String(remote.channel_order_id || '');
         const matches = db
           .prepare('SELECT * FROM orders WHERE external_id=? OR number=? OR number=?')
@@ -463,7 +500,10 @@ export function createIntegrationService(db, crypto, fetcher = fetch) {
                 courier: s.courier,
                 status: mapShipmentStatus(raw),
                 raw_status: raw,
-                status_at: now(),
+                status_at:
+                  mapShipmentStatus(raw) === 'Delivered'
+                    ? shipmentTimestamp(s.delivered_date)
+                    : now(),
                 shipping_cost:
                   s.freight_charges !== undefined ? paise(s.freight_charges) : undefined,
               },
@@ -472,7 +512,12 @@ export function createIntegrationService(db, crypto, fetcher = fetch) {
             );
             count++;
           }
-          reconcileShipments(db, o.id, now());
+          const delivery = db
+            .prepare(
+              "SELECT MAX(status_at) AS at FROM shipments WHERE order_id=? AND status='Delivered'",
+            )
+            .get(o.id);
+          reconcileShipments(db, o.id, delivery.at || now());
         });
       }
       totalPages = Number(d.meta?.pagination?.total_pages || 1);
@@ -482,9 +527,41 @@ export function createIntegrationService(db, crypto, fetcher = fetch) {
           'Shiprocket pagination exceeded the safety limit; restrict your channel.',
         );
     } while (page <= totalPages);
+    // The NDR endpoint carries the reason and attempts that the order list omits.
+    page = 1;
+    totalPages = 1;
+    do {
+      const data = await shipGet(`/ndr/all?page=${page}&per_page=100`);
+      if (!Array.isArray(data.data)) throw new AppError('Unexpected Shiprocket NDR response.', 502);
+      for (const remote of data.data) {
+        if (
+          c.channelId &&
+          remote.shipment_channel_id !== undefined &&
+          String(remote.shipment_channel_id) !== c.channelId
+        )
+          continue;
+        const shipment = db
+          .prepare('SELECT * FROM shipments WHERE awb=?')
+          .get(String(remote.awb_code || ''));
+        if (!shipment || shipment.status !== 'NDR') continue;
+        const reason = String(
+          remote.reason ||
+            remote.history?.[0]?.ndr_reason ||
+            shipment.ndr ||
+            'Delivery attempt unsuccessful',
+        );
+        db.prepare('UPDATE shipments SET ndr=? WHERE id=?').run(
+          `${reason}${remote.attempts ? ` · ${remote.attempts} attempt(s)` : ''}`.slice(0, 1000),
+          shipment.id,
+        );
+      }
+      totalPages = Number(data.meta?.pagination?.total_pages || 1);
+      page++;
+      if (page > 10000) throw new AppError('NDR pagination exceeded the safety limit.');
+    } while (page <= totalPages);
     return {
       count,
-      message: `${count} shipments updated. ${unmatched} unmatched orders. COD remittance requires a separate settlement feed.`,
+      message: `${count} shipments updated. ${unmatched} unmatched orders. COD payouts reconcile through scheduled remittance reports.`,
     };
   }
   async function sync(provider) {
@@ -564,9 +641,9 @@ export function createIntegrationService(db, crypto, fetcher = fetch) {
     try {
       const events = db
         .prepare(
-          "SELECT * FROM webhook_events WHERE status='pending' AND attempts<5 ORDER BY created_at LIMIT 20",
+          "SELECT * FROM webhook_events WHERE provider IN ('shopify','shiprocket') AND status='pending' AND attempts<12 AND (next_attempt_at IS NULL OR next_attempt_at<=?) ORDER BY created_at LIMIT 20",
         )
-        .all();
+        .all(now());
       for (const event of events) {
         try {
           const payload = JSON.parse(event.payload);
@@ -622,8 +699,12 @@ export function createIntegrationService(db, crypto, fetcher = fetch) {
           );
         } catch (e) {
           db.prepare(
-            "UPDATE webhook_events SET attempts=attempts+1,error=?,status=CASE WHEN attempts>=4 THEN 'failed' ELSE 'pending' END WHERE id=?",
-          ).run(e.message.slice(0, 400), event.id);
+            "UPDATE webhook_events SET attempts=attempts+1,error=?,next_attempt_at=?,status=CASE WHEN attempts>=11 THEN 'failed' ELSE 'pending' END WHERE id=?",
+          ).run(
+            e.message.slice(0, 400),
+            new Date(Date.now() + Math.min(3600000, 30000 * 2 ** event.attempts)).toISOString(),
+            event.id,
+          );
         }
       }
     } finally {

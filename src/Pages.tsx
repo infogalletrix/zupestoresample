@@ -93,6 +93,7 @@ import {
 
 import { DailyActions } from './DailyActions';
 import { PaymentReview } from './PaymentReview';
+import { RemittanceAutomation, RemittanceReconciliation } from './Remittances';
 
 export type PageProps = {
   data: Workspace;
@@ -318,6 +319,25 @@ export function Dashboard(p: PageProps) {
         </Notice>
       )}
       <DailyActions {...p} />
+      {!!p.data.operations?.remittancesToReview && (
+        <Notice tone="warning">
+          {p.data.operations.remittancesToReview} remittance rows need review.{' '}
+          <button className="text-link" onClick={() => p.navigate('payments', 'needs:remittance')}>
+            Open reconciliation
+          </button>
+        </Notice>
+      )}
+      {!!p.data.operations &&
+        (p.data.operations.webhookFailures > 0 ||
+          p.data.operations.syncIssues > 0 ||
+          p.data.operations.backupFailed) && (
+          <Notice tone="warning">
+            An integration or backup needs attention.{' '}
+            <button className="text-link" onClick={() => p.navigate('settings')}>
+              Review connection and backup status
+            </button>
+          </Notice>
+        )}
       <div className="dashboard-chart-grid">
         <Panel
           title="Revenue & profit"
@@ -1571,7 +1591,13 @@ export function Expenses(p: PageProps) {
 }
 
 export function Payments(p: PageProps) {
-  const [tab, setTab] = useState(p.search === 'needs:payment' ? 'Pending' : 'All transactions'),
+  const [tab, setTab] = useState(
+      p.search === 'needs:payment'
+        ? 'Pending'
+        : p.search === 'needs:remittance'
+          ? 'Reconciliation'
+          : 'All transactions',
+    ),
     [kind, setKind] = useState('all');
   const [review, setReview] = useState<{ payment: Payment; action: 'complete' | 'cancel' } | null>(
     null,
@@ -1721,40 +1747,61 @@ export function Payments(p: PageProps) {
       </div>
       <Notice>
         Delivery confirms COD collection, not a bank remittance. Shopify prepaid transactions sync
-        automatically. COD remittances require a connected settlement feed or a manual record.
+        automatically. Connect scheduled Shiprocket remittance reports in Settings → Remittance
+        automation. Only verified settlement evidence clears COD outstanding.
       </Notice>
+      {p.data.paymentMetrics && (
+        <div className="settlement-summary">
+          <div>
+            <span>Bank receipts (reported)</span>
+            <strong>{money(p.data.paymentMetrics.bankReceived || 0)}</strong>
+          </div>
+          <div>
+            <span>Settlement deductions</span>
+            <strong>{money(p.data.paymentMetrics.deductions || 0)}</strong>
+          </div>
+          <div>
+            <span>Remittances without bank breakdown</span>
+            <strong>{money(p.data.paymentMetrics.bankUnverified || 0)}</strong>
+          </div>
+        </div>
+      )}
       <Panel>
         <div className="tabs">
-          {['All transactions', 'Completed', 'Pending', 'Cancelled'].map((t) => (
+          {['All transactions', 'Completed', 'Pending', 'Cancelled', 'Reconciliation'].map((t) => (
             <button className={tab === t ? 'active' : ''} onClick={() => setTab(t)} key={t}>
               {t}
             </button>
           ))}
         </div>
-        <DataTable
-          rows={rows}
-          columns={columns}
-          search={p.search.startsWith('needs:') ? '' : p.search}
-          searchPlaceholder="Search order, transaction or reference…"
-          filters={
-            <select
-              aria-label="Filter payment type"
-              value={kind}
-              onChange={(e) => setKind(e.target.value)}
-            >
-              <option value="all">All payment types</option>
-              {[
-                'COD collected',
-                'COD remittance',
-                'Prepaid payment',
-                'Supplier payment',
-                'Customer refund',
-              ].map((k) => (
-                <option key={k}>{k}</option>
-              ))}
-            </select>
-          }
-        />
+        {tab === 'Reconciliation' ? (
+          <RemittanceReconciliation session={p.session} period={p.period} refresh={p.refresh} />
+        ) : (
+          <DataTable
+            rows={rows}
+            columns={columns}
+            search={p.search.startsWith('needs:') ? '' : p.search}
+            searchPlaceholder="Search order, transaction or reference…"
+            filters={
+              <select
+                aria-label="Filter payment type"
+                value={kind}
+                onChange={(e) => setKind(e.target.value)}
+              >
+                <option value="all">All payment types</option>
+                {[
+                  'COD collected',
+                  'COD remittance',
+                  'Prepaid payment',
+                  'Supplier payment',
+                  'Customer refund',
+                ].map((k) => (
+                  <option key={k}>{k}</option>
+                ))}
+              </select>
+            }
+          />
+        )}
       </Panel>
       <div className="page-footnote">
         <Info size={14} /> Collections, remittances and prepaid totals follow payment dates. COD
@@ -2006,7 +2053,7 @@ export function Reports(p: PageProps) {
     ['Shipping & RTO charges', -m.shipping],
     ['Gross profit', m.grossProfit],
     ['Meta Ads spend', -m.adSpend],
-    ['Other manually recorded expenses', -m.otherExpenses],
+    ['Other expenses & settlement fees', -m.otherExpenses],
     ['Net profit', m.netProfit],
   ] as [string, number][];
   return (
@@ -2405,7 +2452,14 @@ export function Settings(p: PageProps) {
         subtitle="Connect your store, manage your team, and keep your data in your hands."
       />
       <div className="report-nav">
-        {['Connections', 'Workspace', 'Team & access', 'Activity', 'Backup & export'].map((t) => (
+        {[
+          'Connections',
+          'Remittance automation',
+          'Workspace',
+          'Team & access',
+          'Activity',
+          'Backup & export',
+        ].map((t) => (
           <button className={tab === t ? 'active' : ''} onClick={() => setTab(t)} key={t}>
             {t}
           </button>
@@ -2419,8 +2473,16 @@ export function Settings(p: PageProps) {
         </div>
       ) : (
         <>
+          {tab === 'Remittance automation' && <RemittanceAutomation session={p.session} />}
           {tab === 'Connections' && (
             <>
+              <Notice>
+                For automatic COD payouts, connect scheduled Shiprocket reports in{' '}
+                <button className="text-link" onClick={() => setTab('Remittance automation')}>
+                  Remittance automation
+                </button>
+                . Shopify handles prepaid payment synchronization.
+              </Notice>
               {p.session.demo && (
                 <Notice>
                   Demo workspace: the records you see are sample data. Sign out and create your
@@ -2763,6 +2825,17 @@ export function Settings(p: PageProps) {
                     <ShieldCheck size={32} />
                   </span>
                   <h3>Your data, in your hands.</h3>
+                  {settings.backupStatus && (
+                    <Notice tone={settings.backupStatus.status === 'Failed' ? 'warning' : 'info'}>
+                      Daily full backups · 14-day retention.{' '}
+                      {settings.backupStatus.lastSuccess
+                        ? `Last verified backup: ${new Date(settings.backupStatus.lastSuccess).toLocaleString('en-IN')}.`
+                        : 'The first scheduled backup is pending.'}{' '}
+                      {settings.backupStatus.status === 'Failed'
+                        ? settings.backupStatus.message
+                        : ''}
+                    </Notice>
+                  )}
                   <p>
                     Download a consistent SQLite backup with business records, users, configuration,
                     and the complete supplier credit ledger.
@@ -2774,9 +2847,16 @@ export function Settings(p: PageProps) {
                     <Download size={16} />
                     Download database backup
                   </a>
+                  {!p.session.demo && admin && (
+                    <a className="button" href="/api/backup/full">
+                      <Download size={16} />
+                      Download full recovery ZIP
+                    </a>
+                  )}
                   <small>
                     Administrator access required. Store backups securely. Keep the server
-                    encryption key separately for restoring saved connections.
+                    encryption key separately for database-only restores. The full recovery ZIP
+                    includes the key and restore instructions; store a private copy off the server.
                   </small>
                 </div>
               </Panel>
@@ -2793,6 +2873,7 @@ export function Settings(p: PageProps) {
                     'payments',
                     'credits',
                     'reports',
+                    'settlements',
                   ].map((t) => (
                     <div key={t}>
                       <span>

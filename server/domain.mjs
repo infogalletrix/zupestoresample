@@ -71,6 +71,11 @@ export const schemas = {
     kind: z.enum(['COD remittance', 'Prepaid payment', 'Supplier payment', 'Customer refund']),
     amount: positiveMoney,
     tax_amount: money.default(0),
+    bank_amount: money.nullable().default(null),
+    fee_amount: money.default(0),
+    shipping_deduction: money.default(0),
+    rto_deduction: money.default(0),
+    other_deduction: money.default(0),
     status: z.enum(['Completed', 'Pending']),
     reference: text.min(1),
     idempotency_key: z.string().min(8),
@@ -266,6 +271,30 @@ export function useCredit(db, input, actor) {
 function validatePayment(db, d, excludeId = null) {
   const order = db.prepare('SELECT * FROM orders WHERE id=?').get(d.order_id);
   if (!order) throw new AppError('Order not found.');
+  const deductions = d.fee_amount + d.shipping_deduction + d.rto_deduction + d.other_deduction;
+  if ((d.bank_amount !== null || deductions) && d.kind !== 'COD remittance')
+    throw new AppError('A bank breakdown is only supported for COD remittances.');
+  if (deductions && d.bank_amount === null)
+    throw new AppError('Enter the bank amount when recording deductions.');
+  if (d.bank_amount !== null && d.amount !== d.bank_amount + deductions)
+    throw new AppError('COD cleared must equal the bank amount plus deductions.');
+  const priorDeductions = db
+    .prepare(
+      'SELECT COALESCE(SUM(shipping_deduction),0) AS shipping,COALESCE(SUM(rto_deduction),0) AS rto FROM payments WHERE order_id=? AND voided_at IS NULL AND id!=?',
+    )
+    .get(order.id, excludeId || '');
+  if (
+    d.shipping_deduction + priorDeductions.shipping > order.shipping_cost ||
+    d.rto_deduction + priorDeductions.rto > order.rto_cost ||
+    (d.shipping_deduction && !order.shipping_verified)
+  )
+    throw new AppError(
+      'Confirm shipping and RTO costs on the order before recording their settlement deductions.',
+    );
+  if (d.other_deduction)
+    throw new AppError(
+      'Classify deductions as shipping, RTO or settlement fees before clearing the payment.',
+    );
   if (d.date < order.date || d.date > today())
     throw new AppError('Payment date must be between the order date and today.');
   if (order.source === 'Shopify' && ['Prepaid payment', 'Customer refund'].includes(d.kind))
@@ -323,9 +352,19 @@ export function recordPayment(db, input, actor) {
     const old = db.prepare('SELECT * FROM payments WHERE external_key=?').get(externalKey);
     if (old) {
       if (
-        ['amount', 'order_id', 'supplier_id', 'kind', 'reference', 'tax_amount'].some(
-          (key) => old[key] !== d[key],
-        )
+        [
+          'amount',
+          'order_id',
+          'supplier_id',
+          'kind',
+          'reference',
+          'tax_amount',
+          'bank_amount',
+          'fee_amount',
+          'shipping_deduction',
+          'rto_deduction',
+          'other_deduction',
+        ].some((key) => old[key] !== d[key])
       )
         throw new AppError('This event was already used for a different payment.', 409);
       return old;
@@ -523,7 +562,9 @@ export function workspace(db, from = '0000-01-01', to = '9999-12-31') {
       const revenue = recognized
         ? Math.max(0, o.total - o.tax - sum('Customer refund') + refundTax)
         : 0;
-      const profit = revenue - (incurred ? cost : 0) + costRecovery - o.shipping_cost - o.rto_cost;
+      const paymentFees = pay.reduce((s, p) => s + (p.fee_amount || 0), 0);
+      const profit =
+        revenue - (incurred ? cost : 0) + costRecovery - o.shipping_cost - o.rto_cost - paymentFees;
       const collected = sum('COD collected'),
         remitted = sum('COD remittance'),
         prepaid = sum('Prepaid payment');
@@ -541,6 +582,7 @@ export function workspace(db, from = '0000-01-01', to = '9999-12-31') {
         payable: Math.max(0, cost - used - sum('Supplier payment')),
         revenue,
         profit,
+        payment_fees: paymentFees,
         cod_collected: collected,
         cod_remitted: remitted,
         cod_pending: Math.max(0, collected - remitted),
@@ -577,7 +619,8 @@ export function workspace(db, from = '0000-01-01', to = '9999-12-31') {
     .filter((e) => e.category === 'Meta Ads')
     .reduce((s, e) => s + e.amount, 0);
   const expenseTotal = sum(selectedExpenses, 'amount');
-  const net = sales - productCost - shipping - expenseTotal;
+  const paymentFees = sum(selected, 'payment_fees');
+  const net = sales - productCost - shipping - expenseTotal - paymentFees;
   const totalAdded = ledger
     .filter((l) => l.type === 'Credit added')
     .reduce((s, l) => s + l.amount, 0);
@@ -621,7 +664,7 @@ export function workspace(db, from = '0000-01-01', to = '9999-12-31') {
   for (const o of selected) {
     const weights = o.items.map((i) => i.price * i.quantity);
     const revenue = allocatePaise(o.revenue, weights);
-    const shipping = allocatePaise(o.shipping_cost + o.rto_cost, weights);
+    const shipping = allocatePaise(o.shipping_cost + o.rto_cost + o.payment_fees, weights);
     const recovery = o.items.map(() => 0);
     for (const entry of (ledgerByOrder.get(o.id) || []).filter((l) => l.type === 'Credit added')) {
       const indexes = o.items
@@ -703,6 +746,30 @@ export function workspace(db, from = '0000-01-01', to = '9999-12-31') {
         .filter((p) => between(p) && p.status === 'Completed' && p.kind === 'Prepaid payment')
         .reduce((s, p) => s + p.amount, 0),
       codPending: sum(orders, 'cod_pending'),
+      bankReceived: payments
+        .filter(
+          (p) =>
+            between(p) &&
+            p.status === 'Completed' &&
+            p.kind === 'COD remittance' &&
+            p.bank_amount !== null,
+        )
+        .reduce((s, p) => s + p.bank_amount, 0),
+      bankUnverified: payments
+        .filter(
+          (p) =>
+            between(p) &&
+            p.status === 'Completed' &&
+            p.kind === 'COD remittance' &&
+            p.bank_amount === null,
+        )
+        .reduce((s, p) => s + p.amount, 0),
+      deductions: payments
+        .filter((p) => between(p) && p.status === 'Completed' && p.kind === 'COD remittance')
+        .reduce(
+          (s, p) => s + p.fee_amount + p.shipping_deduction + p.rto_deduction + p.other_deduction,
+          0,
+        ),
     },
     metrics: {
       totalOrders: selected.length,
@@ -715,7 +782,8 @@ export function workspace(db, from = '0000-01-01', to = '9999-12-31') {
       productCost,
       shipping,
       adSpend,
-      otherExpenses: expenseTotal - adSpend,
+      otherExpenses: expenseTotal - adSpend + paymentFees,
+      paymentFees,
       grossProfit: sales - productCost - shipping,
       netProfit: net,
       margin: sales ? (net / sales) * 100 : 0,

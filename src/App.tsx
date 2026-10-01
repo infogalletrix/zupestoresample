@@ -314,7 +314,7 @@ export default function App() {
           </button>
           <div className="sidebar-version">
             <span className="live-dot" />
-            Zupestore<span>v1.1</span>
+            Zupestore<span>v1.2</span>
           </div>
         </div>
       </aside>

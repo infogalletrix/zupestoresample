@@ -27,6 +27,8 @@ export function openDb(path) {
     CREATE INDEX IF NOT EXISTS ix_items_order ON order_items(order_id);
     CREATE INDEX IF NOT EXISTS ix_ledger_supplier ON credit_ledger(supplier_id);
     CREATE INDEX IF NOT EXISTS ix_payments_order ON payments(order_id);
+    CREATE TABLE IF NOT EXISTS settlement_rows(id TEXT PRIMARY KEY,fingerprint TEXT NOT NULL UNIQUE,source TEXT NOT NULL,filename TEXT NOT NULL,raw TEXT NOT NULL,normalized TEXT,status TEXT NOT NULL,message TEXT NOT NULL DEFAULT '',order_id TEXT REFERENCES orders(id),payment_id TEXT REFERENCES payments(id),created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
+    CREATE INDEX IF NOT EXISTS ix_settlement_status ON settlement_rows(status);
   `);
   // Additive migrations preserve existing workspaces as the local schema evolves.
   for (const [table, column, definition] of [
@@ -35,6 +37,12 @@ export function openDb(path) {
     ['payments', 'tax_amount', 'INTEGER NOT NULL DEFAULT 0'],
     ['payments', 'voided_at', 'TEXT'],
     ['payments', 'void_reason', "TEXT NOT NULL DEFAULT ''"],
+    ['payments', 'bank_amount', 'INTEGER'],
+    ['payments', 'fee_amount', 'INTEGER NOT NULL DEFAULT 0'],
+    ['payments', 'shipping_deduction', 'INTEGER NOT NULL DEFAULT 0'],
+    ['payments', 'rto_deduction', 'INTEGER NOT NULL DEFAULT 0'],
+    ['payments', 'other_deduction', 'INTEGER NOT NULL DEFAULT 0'],
+    ['webhook_events', 'next_attempt_at', 'TEXT'],
   ]) {
     if (
       !db

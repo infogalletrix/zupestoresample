@@ -30,6 +30,9 @@ import { encryption, hashPassword, checkPassword, hashToken, safeEqual } from '.
 import { createIntegrationService } from './integrations.mjs';
 import { seedDemo } from './seed.mjs';
 import { performanceRows } from './reports.mjs';
+import { createReportService } from './report-service.mjs';
+import { registerReportRoutes } from './report-routes.mjs';
+import { createBackupService } from './backups.mjs';
 
 export function createApp(options = {}) {
   const dataDir = resolve(options.dataDir || process.env.DATA_DIR || 'data');
@@ -38,6 +41,8 @@ export function createApp(options = {}) {
   if (options.seed !== false) seedDemo(demoDb);
   const crypto = options.crypto || encryption(dataDir);
   const integrations = createIntegrationService(db, crypto, options.fetcher);
+  const reports = createReportService(db, integrations, options.reportDownloader);
+  const backups = createBackupService(db, dataDir);
   const app = express();
   app.disable('x-powered-by');
   // Enable only when the app is reachable through one trusted reverse proxy.
@@ -94,7 +99,19 @@ export function createApp(options = {}) {
       res.json({ received: true });
     },
   );
-  // A normalized signed feed bridges account-specific remittance APIs without guessing bank settlement from shipment status.
+  app.post(
+    '/api/webhooks/remittance-report/:token',
+    (req, _res, next) => {
+      reports.authorize(req.params.token);
+      next();
+    },
+    express.raw({ type: () => true, limit: '8mb' }),
+    (req, res) => {
+      const event = reports.receive(req.params.token, req.body, req.headers['content-type'] || '');
+      res.status(202).json({ received: true, event });
+    },
+  );
+  // Signed payment events and scheduled reports both require explicit settlement evidence.
   app.post(
     '/api/webhooks/settlements',
     express.raw({ type: 'application/json', limit: '1mb' }),
@@ -147,6 +164,7 @@ export function createApp(options = {}) {
       res.json({ received: true, id: result.id });
     },
   );
+  app.use('/api/remittances/import', express.json({ limit: '12mb' }));
   app.use(express.json({ limit: '1mb' }));
   app.use('/api', (req, res, next) => {
     if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
@@ -273,12 +291,32 @@ export function createApp(options = {}) {
     from: req.query.from ? date.parse(req.query.from) : '0000-01-01',
     to: req.query.to ? date.parse(req.query.to) : '9999-12-31',
   });
+  registerReportRoutes(app, { reports, admin, write, live });
+  app.get('/api/backup/status', admin, live, (_req, res) => res.json(backups.status()));
+  app.get('/api/backup/full', admin, live, async (req, res) => {
+    const backup = await backups.create(req.auth.user.id);
+    res.set('Cache-Control', 'no-store');
+    res.download(backup.file, backup.filename);
+  });
   app.get('/api/workspace', (req, res) => {
     const { from, to } = bounds(req);
     if (from > to) throw new AppError('Start date must be before the end date.');
     res.json({
       ...workspace(req.db, from, to),
       connections: req.auth.demo ? [] : integrations.publicConfig(),
+      operations: {
+        remittancesToReview: req.db
+          .prepare("SELECT COUNT(*) AS count FROM settlement_rows WHERE status='Review'")
+          .get().count,
+        webhookFailures: req.auth.demo
+          ? 0
+          : db.prepare("SELECT COUNT(*) AS count FROM webhook_events WHERE status='failed'").get()
+              .count,
+        syncIssues: req.auth.demo
+          ? 0
+          : integrations.publicConfig().filter((c) => c.status === 'Needs attention').length,
+        backupFailed: req.auth.demo ? false : backups.status().status === 'Failed',
+      },
     });
   });
   app.post('/api/suppliers', write, (req, res) => {
@@ -471,6 +509,7 @@ export function createApp(options = {}) {
         req.auth.user.role === 'admin'
           ? req.db.prepare('SELECT * FROM audit_log ORDER BY created_at DESC LIMIT 50').all()
           : [],
+      backupStatus: !req.auth.demo && req.auth.user.role === 'admin' ? backups.status() : null,
       webhookFailures: req.auth.demo
         ? []
         : req.auth.user.role === 'admin'
@@ -535,7 +574,9 @@ export function createApp(options = {}) {
     res.json(await integrations.sync(req.params.provider)),
   );
   app.post('/api/webhook-retry', admin, live, (_req, res) => {
-    db.prepare("UPDATE webhook_events SET status='pending',attempts=0 WHERE status='failed'").run();
+    db.prepare(
+      "UPDATE webhook_events SET status='pending',attempts=0,next_attempt_at=NULL WHERE status='failed'",
+    ).run();
     res.json({ ok: true });
   });
   app.post('/api/users', admin, live, async (req, res) => {
@@ -605,6 +646,7 @@ export function createApp(options = {}) {
         'suppliers',
         'credits',
         'pending-credits',
+        'settlements',
         'reports',
       ])
       .parse(req.params.type);
@@ -630,6 +672,7 @@ export function createApp(options = {}) {
         Product_cost_INR: o.product_cost / 100,
         Shipping_INR: o.shipping_cost / 100,
         RTO_charges_INR: o.rto_cost / 100,
+        Settlement_fees_INR: o.payment_fees / 100,
         Contribution_INR: o.profit / 100,
         Allocated_overhead_INR: o.allocated_expense / 100,
         Net_profit_INR: o.net_profit / 100,
@@ -640,6 +683,27 @@ export function createApp(options = {}) {
           .join('; '),
         Payment_status: o.payment_status,
       }));
+    else if (type === 'settlements')
+      rows = req.db
+        .prepare('SELECT * FROM settlement_rows ORDER BY created_at DESC')
+        .all()
+        .map((r) => ({
+          ...(r.normalized ? JSON.parse(r.normalized) : {}),
+          Status: r.status,
+          Message: r.message,
+          Source: r.source,
+          Report: r.filename,
+        }))
+        .filter((r) => !r.date || inPeriod(r))
+        .map((r) =>
+          Object.fromEntries(
+            Object.entries(r).map(([k, v]) =>
+              ['gross', 'bank', 'fees', 'shipping', 'rto', 'other'].includes(k)
+                ? [`${k}_INR`, v / 100]
+                : [k, v],
+            ),
+          ),
+        );
     else if (type === 'credits')
       rows = data.ledger.filter(inPeriod).map((l) => ({
         Date: l.date,
@@ -693,6 +757,7 @@ export function createApp(options = {}) {
             'codPending',
             'prepaid',
             'expenseTotal',
+            'paymentFees',
           ].includes(metric)
             ? Number(value) / 100
             : value,
@@ -705,11 +770,18 @@ export function createApp(options = {}) {
             Object.entries(r)
               .filter(
                 ([k, v]) =>
-                  !['password', 'external_key', 'created_by'].includes(k) && typeof v !== 'object',
+                  !['password', 'external_key', 'created_by'].includes(k) &&
+                  (v === null || typeof v !== 'object'),
               )
               .map(([k, v]) => [
                 [
                   'amount',
+                  'bank_amount',
+                  'fee_amount',
+                  'shipping_deduction',
+                  'rto_deduction',
+                  'other_deduction',
+                  'tax_amount',
                   'cost',
                   'price',
                   'revenue',
@@ -723,6 +795,12 @@ export function createApp(options = {}) {
                   : k,
                 [
                   'amount',
+                  'bank_amount',
+                  'fee_amount',
+                  'shipping_deduction',
+                  'rto_deduction',
+                  'other_deduction',
+                  'tax_amount',
                   'cost',
                   'price',
                   'revenue',
@@ -732,12 +810,14 @@ export function createApp(options = {}) {
                   'used',
                   'pending',
                 ].includes(k)
-                  ? Number(v) / 100
+                  ? v === null
+                    ? ''
+                    : Number(v) / 100
                   : v,
               ]),
           ),
         );
-    const keys = rows.length ? Object.keys(rows[0]) : ['No records'];
+    const keys = rows.length ? [...new Set(rows.flatMap((r) => Object.keys(r)))] : ['No records'];
     const safeCell = (v) =>
       typeof v === 'string' && /^[\s]*[=+\-@]/.test(v) ? `'${v}` : (v ?? '');
     if (req.query.format === 'xlsx') {
@@ -806,5 +886,5 @@ export function createApp(options = {}) {
       error: error.status ? error.message : 'An unexpected error occurred. Please try again.',
     });
   });
-  return { app, db, demoDb, integrations };
+  return { app, db, demoDb, integrations, reports, backups };
 }
