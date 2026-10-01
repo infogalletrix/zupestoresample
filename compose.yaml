@@ -1,0 +1,42 @@
+name: zupestore
+
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    init: true
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: '3001'
+      DATA_DIR: /app/data
+      APP_ORIGIN: https://zupestore.galletrix.com
+      COOKIE_SECURE: 'true'
+      TRUST_PROXY: '1'
+      SYNC_INTERVAL_MINUTES: '15'
+      SETUP_TOKEN: ${SETUP_TOKEN:?Set a random SETUP_TOKEN in the server .env file}
+    ports:
+      - '127.0.0.1:3107:3001'
+    volumes:
+      - app_data:/app/data
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'node',
+          '-e',
+          "fetch('http://127.0.0.1:3001/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
+
+volumes:
+  app_data:

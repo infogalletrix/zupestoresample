@@ -158,9 +158,28 @@ The timestamp must be within five minutes. Retried deliveries with the same `eve
 - **Backup:** Settings → Backup & export creates a consistent SQLite backup. Store the encryption key separately; saved connections cannot be decrypted without it. A full backup contains user and session records as well as encrypted configuration.
 - **Restore:** stop the server; preserve the existing entire `data` directory; restore the chosen database backup as `data/commerce.sqlite` into a fresh data directory, with the matching key file or environment key. Start with `DATA_DIR` pointing to that directory. Do not overwrite a live SQLite database or mix old WAL files with a restored database. Restoring a backup also restores its saved users/configuration; clear restored sessions through a controlled administration process if they should not remain valid.
 
-For hosted use, build the app and run one server process with a persistent local database volume, a trusted HTTPS reverse proxy, `APP_ORIGIN=https://YOUR-DOMAIN`, `COOKIE_SECURE=true`, and `NODE_ENV=production`. Protect first-owner setup with a strong `SETUP_TOKEN` until the account exists. The optional `Dockerfile` builds the same application; no deployment has been performed. The default host binding is loopback to keep local development private.
+For hosted use, build the app and run one server process with a persistent local database volume, a trusted HTTPS reverse proxy, `APP_ORIGIN=https://YOUR-DOMAIN`, `COOKIE_SECURE=true`, and `NODE_ENV=production`. Protect first-owner setup with a strong `SETUP_TOKEN` until the account exists. The `Dockerfile` builds the same application. The default host binding is loopback to keep local development private.
 
 Copy `.env.example` to `.env` only if you want to change defaults. For a local production build set `APP_ORIGIN=http://127.0.0.1:3001`. Polling requires a continuously running server; laptop sleep stops polling. Public webhooks require a reachable HTTPS URL. This local SQLite edition uses one process and loads reporting records into memory; migrate storage/query pagination before large-scale or multi-instance hosting.
+
+### VPS deployment: zupestore.galletrix.com
+
+`compose.yaml` runs the app behind the VPS's Nginx server on `127.0.0.1:3107`. It enables secure cookies, automatic restarts, a health check and bounded container logs. Database files and the encryption key persist in the `zupestore_app_data` Docker volume. `TRUST_PROXY=1` makes rate limits apply per client behind this single proxy; keep the app port private and use the supplied Nginx forwarding-header configuration.
+
+On a server with Docker Compose, Nginx and Certbot installed:
+
+```sh
+git clone https://github.com/infogalletrix/zupestoresample.git /opt/zupestore
+cd /opt/zupestore
+# First deployment only: generate a private setup token, never commit it.
+(umask 077; printf 'SETUP_TOKEN=%s\n' "$(openssl rand -hex 32)" > .env)
+docker compose up -d --build --wait
+curl --fail http://127.0.0.1:3107/api/health
+```
+
+Install `deploy/zupestore.nginx.conf` as a new virtual host for this domain, check `nginx -t`, and reload Nginx. With DNS pointing to the VPS, issue its certificate using `certbot --nginx -d zupestore.galletrix.com --redirect`. Keep the Certbot renewal timer enabled. On the HTTPS site, expand **Have a hosting setup token?** and use the token from the server's `.env` when creating the first administrator. Choose your own email and password; no default administrator account is installed.
+
+For updates, run `git pull --ff-only` and `docker compose up -d --build --wait` in `/opt/zupestore`. Back up the live database through **Settings > Backup & export** and preserve the volume's `.encryption-key` separately before updating. Do not remove the data volume. Shopify, Shiprocket and settlement credentials are configured by the administrator in the app after deployment.
 
 ## Validation and source map
 

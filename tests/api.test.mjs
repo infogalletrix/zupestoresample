@@ -72,6 +72,29 @@ test('CSRF guard rejects cross-site mutations and missing verification header', 
     .send({})
     .expect(403);
 });
+test('trusted reverse proxy applies authentication limits per client IP', async (t) => {
+  const previous = process.env.TRUST_PROXY;
+  process.env.TRUST_PROXY = '1';
+  let app;
+  try {
+    ({ app } = fixture(t));
+  } finally {
+    if (previous === undefined) delete process.env.TRUST_PROXY;
+    else process.env.TRUST_PROXY = previous;
+  }
+  for (let i = 0; i < 20; i++) {
+    await request(app)
+      .get('/api/auth/session')
+      .set('X-Forwarded-For', '203.0.113.1, 198.51.100.1')
+      .expect(200);
+  }
+  // Changing an untrusted earlier address cannot evade this client's limit.
+  await request(app)
+    .get('/api/auth/session')
+    .set('X-Forwarded-For', '203.0.113.2, 198.51.100.1')
+    .expect(429);
+  await request(app).get('/api/auth/session').set('X-Forwarded-For', '198.51.100.2').expect(200);
+});
 test('viewer can read/export but cannot write or manage settings', async (t) => {
   const { app, db } = fixture(t);
   await owner(app);

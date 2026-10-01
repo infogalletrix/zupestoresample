@@ -37,6 +37,8 @@ export function createApp(options = {}) {
   const integrations = createIntegrationService(db, crypto, options.fetcher);
   const app = express();
   app.disable('x-powered-by');
+  // Enable only when the app is reachable through one trusted reverse proxy.
+  if (process.env.TRUST_PROXY === '1') app.set('trust proxy', 1);
   app.use(
     helmet({
       contentSecurityPolicy:
@@ -623,17 +625,15 @@ export function createApp(options = {}) {
         Payment_status: o.payment_status,
       }));
     else if (type === 'credits')
-      rows = data.ledger
-        .filter(inPeriod)
-        .map((l) => ({
-          Date: l.date,
-          Supplier: data.suppliers.find((s) => s.id === l.supplier_id)?.name,
-          Order: data.orders.find((o) => o.id === l.order_id)?.number,
-          Type: l.type,
-          Amount_INR: l.amount / 100,
-          Reference: l.reference,
-          Notes: l.notes,
-        }));
+      rows = data.ledger.filter(inPeriod).map((l) => ({
+        Date: l.date,
+        Supplier: data.suppliers.find((s) => s.id === l.supplier_id)?.name,
+        Order: data.orders.find((o) => o.id === l.order_id)?.number,
+        Type: l.type,
+        Amount_INR: l.amount / 100,
+        Reference: l.reference,
+        Notes: l.notes,
+      }));
     else if (type === 'pending-credits')
       rows = data.orders
         .filter((o) => o.status === 'RTO' && o.product_cost > o.credit_received)
@@ -743,13 +743,19 @@ export function createApp(options = {}) {
         'Content-Type',
         'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
       );
-      res.setHeader('Content-Disposition', `attachment; filename="zupestore-${type}-${today()}.xlsx"`);
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="zupestore-${type}-${today()}.xlsx"`,
+      );
       await book.xlsx.write(res);
       res.end();
     } else {
       const cell = (v) => `"${String(safeCell(v)).replaceAll('"', '""')}"`;
       res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-      res.setHeader('Content-Disposition', `attachment; filename="zupestore-${type}-${today()}.csv"`);
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="zupestore-${type}-${today()}.csv"`,
+      );
       res.send(
         '\uFEFF' +
           [
@@ -770,11 +776,9 @@ export function createApp(options = {}) {
         .status(400)
         .json({ error: error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ') });
     if (String(error.message).includes('UNIQUE constraint'))
-      return res
-        .status(409)
-        .json({
-          error: 'This record already exists. Check the SKU, email, order number, or reference.',
-        });
+      return res.status(409).json({
+        error: 'This record already exists. Check the SKU, email, order number, or reference.',
+      });
     if (String(error.message).includes('FOREIGN KEY constraint'))
       return res
         .status(400)
@@ -782,11 +786,9 @@ export function createApp(options = {}) {
     if (error.type === 'entity.parse.failed')
       return res.status(400).json({ error: 'Invalid JSON request.' });
     if (!error.status) console.error(error);
-    res
-      .status(error.status || 500)
-      .json({
-        error: error.status ? error.message : 'An unexpected error occurred. Please try again.',
-      });
+    res.status(error.status || 500).json({
+      error: error.status ? error.message : 'An unexpected error occurred. Please try again.',
+    });
   });
   return { app, db, demoDb, integrations };
 }
