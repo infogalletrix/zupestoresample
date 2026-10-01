@@ -30,12 +30,12 @@ export function Badge({ children, tone }: { children: ReactNode; tone?: string }
   const value = String(children);
   const color =
     tone ||
-    (/Delivered|Completed|Credited|Connected|Paid|Remitted|Success|Credit added/i.test(value)
-      ? 'green'
+    (/RTO|Failed|Cancelled/i.test(value)
+      ? 'red'
       : /NDR|Pending|Awaiting|Partially|attention/i.test(value)
         ? 'amber'
-        : /RTO|Failed|Cancelled/i.test(value)
-          ? 'red'
+        : /Delivered|Completed|Credited|Connected|Paid|Remitted|Success|Credit added/i.test(value)
+          ? 'green'
           : /Shipped|Credit used/i.test(value)
             ? 'purple'
             : 'neutral');
@@ -164,10 +164,14 @@ export function DataTable<T extends { id: string }>({
   empty?: ReactNode;
   toolbar?: boolean;
 }) {
-  const [search, setSearch] = useState(''),
+  const [search, setSearch] = useState(externalSearch),
     [page, setPage] = useState(1),
+    [limit, setLimit] = useState(pageSize),
     [sort, setSort] = useState<{ key: string; direction: number } | null>(null);
-  const query = (externalSearch || search).toLowerCase();
+  useEffect(() => {
+    setSearch(externalSearch);
+  }, [externalSearch]);
+  const query = search.trim().toLowerCase();
   const filtered = rows.filter((r) =>
     columns.some((c) =>
       String(c.value ? c.value(r) : ((r as Record<string, unknown>)[c.key] ?? ''))
@@ -187,10 +191,10 @@ export function DataTable<T extends { id: string }>({
       );
     });
   }
-  const maxPage = Math.max(1, Math.ceil(filtered.length / pageSize)),
+  const maxPage = Math.max(1, Math.ceil(filtered.length / limit)),
     currentPage = Math.min(page, maxPage),
-    start = (currentPage - 1) * pageSize;
-  useEffect(() => setPage(1), [query, rows.length]);
+    start = (currentPage - 1) * limit;
+  useEffect(() => setPage(1), [query, rows.length, limit, sort]);
   return (
     <div className="data-table">
       {toolbar && (
@@ -200,9 +204,8 @@ export function DataTable<T extends { id: string }>({
             <input
               aria-label={searchPlaceholder}
               placeholder={searchPlaceholder}
-              value={externalSearch || search}
+              value={search}
               onChange={(e) => setSearch(e.target.value)}
-              readOnly={!!externalSearch}
             />
             {search && (
               <button
@@ -227,8 +230,19 @@ export function DataTable<T extends { id: string }>({
               <thead>
                 <tr>
                   {columns.map((c) => (
-                    <th key={c.key} className={c.className}>
+                    <th
+                      key={c.key}
+                      className={c.className}
+                      aria-sort={
+                        sort?.key === c.key
+                          ? sort.direction === 1
+                            ? 'ascending'
+                            : 'descending'
+                          : undefined
+                      }
+                    >
                       <button
+                        disabled={!c.label}
                         onClick={() =>
                           setSort((s) => ({
                             key: c.key,
@@ -243,20 +257,27 @@ export function DataTable<T extends { id: string }>({
                           ) : (
                             <ArrowDown size={12} />
                           )
-                        ) : (
+                        ) : c.label ? (
                           <ArrowDownUp size={11} />
-                        )}
+                        ) : null}
                       </button>
                     </th>
                   ))}
                 </tr>
               </thead>
               <tbody>
-                {filtered.slice(start, start + pageSize).map((row) => (
+                {filtered.slice(start, start + limit).map((row) => (
                   <tr
                     key={row.id}
                     className={onRow ? 'clickable' : ''}
                     onClick={() => onRow?.(row)}
+                    tabIndex={onRow ? 0 : undefined}
+                    onKeyDown={(e) => {
+                      if (e.target === e.currentTarget && (e.key === 'Enter' || e.key === ' ')) {
+                        e.preventDefault();
+                        onRow?.(row);
+                      }
+                    }}
                   >
                     {columns.map((c) => (
                       <td key={c.key} className={c.className}>
@@ -274,10 +295,28 @@ export function DataTable<T extends { id: string }>({
             <span>
               Showing{' '}
               <strong>
-                {start + 1}–{Math.min(start + pageSize, filtered.length)}
+                {start + 1}–{Math.min(start + limit, filtered.length)}
               </strong>{' '}
               of <strong>{filtered.length}</strong>
             </span>
+            {toolbar && (
+              <label className="page-size">
+                Rows{' '}
+                <select
+                  aria-label="Rows per page"
+                  value={limit}
+                  onChange={(e) => setLimit(Number(e.target.value))}
+                >
+                  {[...new Set([pageSize, 25, 50])]
+                    .sort((a, b) => a - b)
+                    .map((n) => (
+                      <option key={n} value={n}>
+                        {n}
+                      </option>
+                    ))}
+                </select>
+              </label>
+            )}
             <div className="pagination">
               <button
                 className="icon-button"
@@ -312,7 +351,7 @@ export function DataTable<T extends { id: string }>({
           </div>
         </>
       ) : (
-        empty || (
+        (!query && empty) || (
           <Empty
             title={query ? 'No matching records' : 'No records yet'}
             description={
@@ -338,11 +377,22 @@ export function DatePicker({
     [to, setTo] = useState(period.to);
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
+    setFrom(period.from);
+    setTo(period.to);
+  }, [period.from, period.to]);
+  useEffect(() => {
     const close = (e: MouseEvent) => {
       if (!ref.current?.contains(e.target as Node)) setOpen(false);
     };
     document.addEventListener('mousedown', close);
-    return () => document.removeEventListener('mousedown', close);
+    const escape = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setOpen(false);
+    };
+    document.addEventListener('keydown', escape);
+    return () => {
+      document.removeEventListener('mousedown', close);
+      document.removeEventListener('keydown', escape);
+    };
   }, []);
   return (
     <div className="date-picker" ref={ref}>
@@ -357,21 +407,28 @@ export function DatePicker({
       </button>
       {open && (
         <div className="date-popover">
-          {['Today', 'This week', 'Last 30 days', 'This month', 'This year', 'All time'].map(
-            (label) => (
-              <button
-                className={period.label === label ? 'selected' : ''}
-                key={label}
-                onClick={() => {
-                  onChange(makePeriod(label));
-                  setOpen(false);
-                }}
-              >
-                {label}
-                {period.label === label && <Check size={15} />}
-              </button>
-            ),
-          )}
+          {[
+            'Today',
+            'Yesterday',
+            'Last 7 days',
+            'This week',
+            'Last 30 days',
+            'This month',
+            'This year',
+            'All time',
+          ].map((label) => (
+            <button
+              className={period.label === label ? 'selected' : ''}
+              key={label}
+              onClick={() => {
+                onChange(makePeriod(label));
+                setOpen(false);
+              }}
+            >
+              {label}
+              {period.label === label && <Check size={15} />}
+            </button>
+          ))}
           <form
             onSubmit={(e) => {
               e.preventDefault();

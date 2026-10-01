@@ -243,7 +243,8 @@ export function ModalForms({ data, modal, close, done, canWrite }: FormProps) {
             (p) =>
               p.order_id === orderId &&
               p.supplier_id === supplierId &&
-              p.kind === 'Supplier payment',
+              p.kind === 'Supplier payment' &&
+              p.status !== 'Cancelled',
           )
           .reduce((s, p) => s + p.amount, 0)
       : 0;
@@ -436,14 +437,52 @@ export function ModalForms({ data, modal, close, done, canWrite }: FormProps) {
       </Dialog>
     );
   if (modal.type === 'payment') {
+    const limitFor = (o: Order, supplier = supplierId) => {
+      const sum = (kind: string, completedOnly = false) =>
+        data.payments
+          .filter(
+            (p) =>
+              p.order_id === o.id &&
+              p.kind === kind &&
+              p.status !== 'Cancelled' &&
+              (!completedOnly || p.status === 'Completed') &&
+              (kind !== 'Supplier payment' || p.supplier_id === supplier),
+          )
+          .reduce((s, p) => s + p.amount, 0);
+      if (paymentKind === 'COD remittance')
+        return Math.max(0, sum('COD collected', true) - sum(paymentKind));
+      if (paymentKind === 'Prepaid payment') return Math.max(0, o.total - sum(paymentKind));
+      if (paymentKind === 'Customer refund')
+        return Math.max(
+          0,
+          sum('Prepaid payment', true) + sum('COD collected', true) - sum(paymentKind),
+        );
+      const cost = o.items
+        .filter((i) => i.supplier_id === supplier)
+        .reduce((s, i) => s + i.cost * i.quantity, 0);
+      const used = data.ledger
+        .filter(
+          (l) => l.order_id === o.id && l.supplier_id === supplier && l.type === 'Credit used',
+        )
+        .reduce((s, l) => s + l.amount, 0);
+      return Math.max(0, cost - used - sum(paymentKind));
+    };
     const eligible = data.orders.filter((o) =>
       paymentKind === 'COD remittance'
-        ? o.method === 'COD' && o.cod_pending > 0
+        ? o.method === 'COD' && limitFor(o) > 0
         : paymentKind === 'Prepaid payment'
-          ? o.method === 'Prepaid' && o.source !== 'Shopify'
+          ? o.method === 'Prepaid' &&
+            o.source !== 'Shopify' &&
+            o.status !== 'Cancelled' &&
+            limitFor(o) > 0
           : paymentKind === 'Customer refund'
-            ? o.source !== 'Shopify'
-            : true,
+            ? o.source !== 'Shopify' && limitFor(o) > 0
+            : o.status !== 'Cancelled',
+    );
+    const selectedOrder = eligible.find((o) => o.id === orderId);
+    const remaining = selectedOrder ? limitFor(selectedOrder) : 0;
+    const availableSuppliers = data.suppliers.filter((s) =>
+      selectedOrder?.items.some((i) => i.supplier_id === s.id),
     );
     return (
       <Dialog
@@ -472,9 +511,39 @@ export function ModalForms({ data, modal, close, done, canWrite }: FormProps) {
           }
         >
           {errorNotice}
+          {selectedOrder && (
+            <div className="payment-limit">
+              <div>
+                <span>Available to record</span>
+                <strong>{money(remaining)}</strong>
+                <small>After existing payments, reservations and supplier credits</small>
+              </div>
+              <button
+                type="button"
+                className="button small"
+                onClick={() => setAmount((remaining / 100).toFixed(2))}
+                disabled={!remaining}
+              >
+                Use full amount
+              </button>
+            </div>
+          )}
+          {!eligible.length && (
+            <Notice>
+              No eligible orders for this payment type. Check existing payments or choose another
+              type.
+            </Notice>
+          )}
           <div className="form-grid">
             <Field label="Payment type" full>
-              <select value={paymentKind} onChange={(e) => setPaymentKind(e.target.value)}>
+              <select
+                value={paymentKind}
+                onChange={(e) => {
+                  setPaymentKind(e.target.value);
+                  setOrderId('');
+                  setAmount('');
+                }}
+              >
                 {['COD remittance', 'Prepaid payment', 'Supplier payment', 'Customer refund'].map(
                   (k) => (
                     <option key={k}>{k}</option>
@@ -483,7 +552,19 @@ export function ModalForms({ data, modal, close, done, canWrite }: FormProps) {
               </select>
             </Field>
             <Field label="Order" full>
-              <select name="order_id" defaultValue={modal.orderId || ''} required>
+              <select
+                name="order_id"
+                value={orderId}
+                onChange={(e) => {
+                  setOrderId(e.target.value);
+                  setAmount('');
+                  const first = data.orders
+                    .find((o) => o.id === e.target.value)
+                    ?.items.find((i) => i.supplier_id)?.supplier_id;
+                  if (first) setSupplierId(first);
+                }}
+                required
+              >
                 <option value="">Select order</option>
                 {eligible.map((o) => (
                   <option key={o.id} value={o.id}>
@@ -495,13 +576,30 @@ export function ModalForms({ data, modal, close, done, canWrite }: FormProps) {
             </Field>
             {paymentKind === 'Supplier payment' && (
               <Field label="Supplier" full>
-                {supplierSelect}
+                <select
+                  value={supplierId}
+                  onChange={(e) => {
+                    setSupplierId(e.target.value);
+                    setAmount('');
+                  }}
+                  required
+                >
+                  <option value="">Select supplier</option>
+                  {availableSuppliers.map((s) => (
+                    <option key={s.id} value={s.id}>
+                      {s.name}
+                    </option>
+                  ))}
+                </select>
               </Field>
             )}
             <Field label="Amount (₹)">
               <input
                 type="number"
                 name="amount"
+                value={amount}
+                onChange={(e) => setAmount(e.target.value)}
+                max={remaining / 100}
                 min="0.01"
                 step="0.01"
                 placeholder="0.00"
@@ -528,8 +626,9 @@ export function ModalForms({ data, modal, close, done, canWrite }: FormProps) {
             </Field>
           </div>
           <Notice>
-            Only completed payments affect totals. Prepaid payments and refunds on Shopify orders
-            must be recorded in Shopify; they synchronize automatically.
+            Pending payments reserve the balance; only completed payments affect totals. Prepaid
+            payments and refunds on Shopify orders must be recorded in Shopify; they synchronize
+            automatically.
           </Notice>
           <Submit busy={busy} close={close} label="Record payment" />
         </form>
@@ -1038,7 +1137,7 @@ export function ModalForms({ data, modal, close, done, canWrite }: FormProps) {
                 {o.source !== 'Shopify' && (
                   <Field label="Order status">
                     <select name="status" defaultValue={o.status}>
-                      {['Confirmed', 'Shipped', 'Delivered', 'NDR', 'RTO', 'Cancelled'].map((s) => (
+                      {(o.allowed_statuses || [o.status]).map((s) => (
                         <option key={s}>{s}</option>
                       ))}
                     </select>
@@ -1310,9 +1409,11 @@ export function ModalForms({ data, modal, close, done, canWrite }: FormProps) {
 }
 export function AuthScreen({
   needsSetup,
+  setupTokenRequired = false,
   onLogin,
 }: {
   needsSetup: boolean;
+  setupTokenRequired?: boolean;
   onLogin: () => Promise<void>;
 }) {
   const [mode, setMode] = useState(needsSetup ? 'setup' : 'login'),
@@ -1431,11 +1532,26 @@ export function AuthScreen({
                 autoComplete={mode === 'setup' ? 'new-password' : 'current-password'}
               />
             </Field>
-            {mode === 'setup' && (
-              <details className="setup-token">
-                <summary>Have a hosting setup token?</summary>
-                <input name="setupToken" type="password" placeholder="Setup token (optional)" />
-              </details>
+            {mode === 'setup' && setupTokenRequired ? (
+              <Field
+                label="Hosting setup token"
+                hint="Use the private token provided with your deployment. Required only for the first administrator."
+              >
+                <input
+                  name="setupToken"
+                  type="password"
+                  autoComplete="off"
+                  required
+                  placeholder="Paste your setup token"
+                />
+              </Field>
+            ) : (
+              mode === 'setup' && (
+                <details className="setup-token">
+                  <summary>Have a hosting setup token?</summary>
+                  <input name="setupToken" type="password" placeholder="Setup token (optional)" />
+                </details>
+              )
             )}
             <button className="button primary full-width auth-submit" disabled={busy}>
               {busy ? (

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Area,
   AreaChart,
@@ -90,6 +90,9 @@ import {
   Stat,
   type Column,
 } from './components';
+
+import { DailyActions } from './DailyActions';
+import { PaymentReview } from './PaymentReview';
 
 export type PageProps = {
   data: Workspace;
@@ -239,9 +242,9 @@ export function Dashboard(p: PageProps) {
   return (
     <>
       <PageHeading
-        eyebrow="THE BIG PICTURE"
-        title={`A clearer view. A better business.`}
-        subtitle={`Welcome back, ${session.user.name.split(' ')[0]}. Here’s how your store is doing.`}
+        eyebrow="BUSINESS OVERVIEW"
+        title="Your store, at a glance."
+        subtitle={`Welcome back, ${session.user.name.split(' ')[0]}. Here is what matters for your business today.`}
       >
         <ExportButton type="reports" period={period} />
         {session.user.role !== 'viewer' && (
@@ -251,17 +254,31 @@ export function Dashboard(p: PageProps) {
           </button>
         )}
       </PageHeading>
-      <div className="overview-strip">
-        <div>
-          <span className="live-dot" />
-          <strong>{session.demo ? 'Demo workspace' : 'Your workspace'}</strong>
-          <span>
-            {session.demo ? 'Explore with sample data' : 'Connected operations, clearer decisions'}
-          </span>
-        </div>
-        <button onClick={() => navigate('settings')}>
-          {session.demo ? 'Set up your integrations' : 'Manage integrations'}
-          <ArrowRight size={14} />
+      <div className="connection-strip">
+        <span className="connection-label">
+          {session.demo ? 'Demo workspace' : 'Store connections'}
+        </span>
+        {['shopify', 'shiprocket'].map((provider) => {
+          const connection = data.connections?.find((c) => c.provider === provider);
+          return (
+            <span
+              key={provider}
+              className={`connection-chip ${connection?.status === 'Connected' ? 'configured' : ''}`}
+            >
+              <i />
+              {provider === 'shopify' ? 'Shopify' : 'Shiprocket'}
+              <small>
+                {session.demo
+                  ? 'Sample data'
+                  : connection?.configured
+                    ? connection.status
+                    : 'Not connected'}
+              </small>
+            </span>
+          );
+        })}
+        <button className="text-button" onClick={() => navigate('settings')}>
+          Manage <ArrowUpRight size={15} />
         </button>
       </div>
       <div className="stats-grid">
@@ -277,7 +294,7 @@ export function Dashboard(p: PageProps) {
           value={money(m.netProfit)}
           note={`${m.margin.toFixed(1)}% profit margin`}
           icon={<TrendingUp size={20} />}
-          accent="green"
+          accent={m.netProfit < 0 ? 'red' : 'green'}
         />
         <Stat
           label="Total orders"
@@ -300,10 +317,11 @@ export function Dashboard(p: PageProps) {
           order costs before relying on profit figures.
         </Notice>
       )}
+      <DailyActions {...p} />
       <div className="dashboard-chart-grid">
         <Panel
           title="Revenue & profit"
-          subtitle="A little perspective on your performance"
+          subtitle="Delivered sales and profit after all recorded costs"
           action={
             <span className="subtle-label">
               {period.label}
@@ -462,8 +480,8 @@ export function Dashboard(p: PageProps) {
         ))}
       </div>
       <Panel
-        title="The cost of doing business"
-        subtitle="Every part of your profit, accounted for"
+        title="Where your money goes"
+        subtitle="A clear breakdown for the selected period"
         action={
           <button className="text-button" onClick={() => navigate('reports')}>
             Profit & loss <ArrowRight size={14} />
@@ -559,7 +577,16 @@ function ChevronDownIcon() {
 export function Orders(p: PageProps) {
   const [tab, setTab] = useState('All orders');
   const rows = p.data.orders.filter((o) => inPeriod(o.date, p.period));
-  const visible = tab === 'All orders' ? rows : rows.filter((o) => o.status === tab);
+  const filtered = rows.filter((o) =>
+    p.search === 'needs:ndr'
+      ? o.status === 'NDR'
+      : p.search === 'needs:cost'
+        ? o.status !== 'Cancelled' &&
+          (!o.cost_verified ||
+            (!['Confirmed', 'Cancelled'].includes(o.status) && !o.shipping_verified))
+        : true,
+  );
+  const visible = tab === 'All orders' ? filtered : filtered.filter((o) => o.status === tab);
   return (
     <>
       <PageHeading
@@ -620,7 +647,7 @@ export function Orders(p: PageProps) {
         <DataTable
           rows={visible}
           columns={orderColumns(p.open)}
-          search={p.search}
+          search={p.search.startsWith('needs:') ? '' : p.search}
           searchPlaceholder="Search order ID, customer, product or status…"
           pageSize={10}
           onRow={(o) => p.open({ type: 'orderDetail', record: o })}
@@ -637,7 +664,7 @@ export function Orders(p: PageProps) {
 export function RtoBalance(p: PageProps) {
   const { data, period, open, session } = p,
     c = data.credit;
-  const [tab, setTab] = useState('Credit ledger'),
+  const [tab, setTab] = useState(p.search === 'needs:credit' ? 'Pending credits' : 'Credit ledger'),
     [supplier, setSupplier] = useState('all'),
     [type, setType] = useState('all');
   const filtered = data.ledger.filter(
@@ -1016,7 +1043,7 @@ export function RtoBalance(p: PageProps) {
             }
             columns={columns}
             searchPlaceholder="Search order, supplier, product or reference…"
-            search={p.search}
+            search={p.search.startsWith('needs:') ? '' : p.search}
             filters={
               <>
                 <select
@@ -1544,9 +1571,13 @@ export function Expenses(p: PageProps) {
 }
 
 export function Payments(p: PageProps) {
-  const [tab, setTab] = useState('All transactions'),
+  const [tab, setTab] = useState(p.search === 'needs:payment' ? 'Pending' : 'All transactions'),
     [kind, setKind] = useState('all');
-  const m = p.data.metrics,
+  const [review, setReview] = useState<{ payment: Payment; action: 'complete' | 'cancel' } | null>(
+    null,
+  );
+  const closeReview = useCallback(() => setReview(null), []);
+  const m = p.data.paymentMetrics || p.data.metrics,
     rows = p.data.payments
       .filter((r) => inPeriod(r.date, p.period))
       .filter(
@@ -1602,30 +1633,49 @@ export function Payments(p: PageProps) {
       key: 'action',
       label: '',
       render: (r) =>
-        r.status === 'Pending' && p.session.user.role !== 'viewer' ? (
-          <button
-            className="button small"
-            onClick={async () => {
-              try {
-                await api(`/payments/${r.id}/complete`, { method: 'PATCH' });
-                await p.refresh('Payment marked completed.');
-              } catch (e) {
-                p.notify((e as Error).message, true);
-              }
-            }}
-          >
-            <Check size={14} />
-            Complete
-          </button>
-        ) : (
-          <span className="muted">
-            <CheckCircle2 size={16} />
+        r.status === 'Pending' && r.source === 'Manual' && p.session.user.role !== 'viewer' ? (
+          <div className="payment-row-actions">
+            <button
+              className="button small"
+              onClick={() => setReview({ payment: r, action: 'complete' })}
+            >
+              <Check size={14} /> Complete
+            </button>
+            <button
+              className="icon-button"
+              aria-label={`Cancel pending payment ${r.reference}`}
+              title="Cancel pending payment"
+              onClick={() => setReview({ payment: r, action: 'cancel' })}
+            >
+              <XCircle size={17} />
+            </button>
+          </div>
+        ) : r.status === 'Cancelled' ? (
+          <span className="muted" title={r.void_reason}>
+            Cancelled
           </span>
+        ) : (
+          <CheckCircle2 className="muted" size={16} />
         ),
     },
   ];
   return (
     <>
+      {review && (
+        <PaymentReview
+          payment={review.payment}
+          action={review.action}
+          order={p.data.orders.find((o) => o.id === review.payment.order_id)}
+          onClose={closeReview}
+          onSaved={() =>
+            p.refresh(
+              review.action === 'complete'
+                ? 'Payment completed.'
+                : 'Pending payment cancelled. Balance released.',
+            )
+          }
+        />
+      )}
       <PageHeading
         eyebrow="FOLLOW THE MONEY"
         title="Payments & remittances"
@@ -1643,28 +1693,28 @@ export function Payments(p: PageProps) {
         <Stat
           label="COD collected"
           value={money(m.codCollected)}
-          note="Delivered COD order cohort"
+          note="Collected in the selected period"
           icon={<Banknote size={20} />}
           accent="blue"
         />
         <Stat
           label="COD remitted"
           value={money(m.codRemitted)}
-          note="Confirmed settlements for cohort"
+          note="Settled in the selected period"
           icon={<CheckCircle2 size={20} />}
           accent="green"
         />
         <Stat
           label="COD pending"
           value={money(m.codPending)}
-          note="Collected, not yet remitted"
+          note="Outstanding across all dates"
           icon={<Clock3 size={20} />}
           accent="amber"
         />
         <Stat
           label="Prepaid payments"
           value={money(m.prepaid)}
-          note="Customer payments for cohort"
+          note="Received in the selected period"
           icon={<CreditCard size={20} />}
           accent="purple"
         />
@@ -1675,7 +1725,7 @@ export function Payments(p: PageProps) {
       </Notice>
       <Panel>
         <div className="tabs">
-          {['All transactions', 'Completed', 'Pending'].map((t) => (
+          {['All transactions', 'Completed', 'Pending', 'Cancelled'].map((t) => (
             <button className={tab === t ? 'active' : ''} onClick={() => setTab(t)} key={t}>
               {t}
             </button>
@@ -1684,7 +1734,7 @@ export function Payments(p: PageProps) {
         <DataTable
           rows={rows}
           columns={columns}
-          search={p.search}
+          search={p.search.startsWith('needs:') ? '' : p.search}
           searchPlaceholder="Search order, transaction or reference…"
           filters={
             <select
@@ -1707,8 +1757,9 @@ export function Payments(p: PageProps) {
         />
       </Panel>
       <div className="page-footnote">
-        <Info size={14} /> Summary cards follow order dates; the ledger follows payment dates.
-        Customer collections and remittances are separate stages, not additive cash receipts.
+        <Info size={14} /> Collections, remittances and prepaid totals follow payment dates. COD
+        pending is the outstanding balance across all dates. Customer collections and remittances
+        are separate stages, not additive cash receipts.
       </div>
     </>
   );

@@ -7,6 +7,9 @@ import {
   supplierBalance,
   createOrder,
   recordPayment,
+  completePayment,
+  cancelPayment,
+  allocatePaise,
   workspace,
   collectCod,
   today,
@@ -391,5 +394,169 @@ test('foreign currency is rejected instead of silently treating it as INR', () =
   const db = fixture();
   assert.throws(() => normalizeShopify(db, remote({ currencyCode: 'USD' })), /not in INR/);
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM orders').get().n, 0);
+  db.close();
+});
+
+test('pending cancellation releases the reserved balance and preserves its audit history', () => {
+  const db = fixture(),
+    o = order(db, 'p500', 'Confirmed', 'Prepaid');
+  const pending = pay(db, o, 'Prepaid payment', 40000, { status: 'Pending' });
+  cancelPayment(db, pending.id, 'Payment was never sent', 'owner');
+  pay(db, o, 'Prepaid payment', 100000);
+  const state = workspace(db);
+  assert.equal(state.orders[0].prepaid, 100000);
+  assert.equal(state.payments.find((p) => p.id === pending.id).status, 'Cancelled');
+  assert.equal(
+    state.payments.find((p) => p.id === pending.id).void_reason,
+    'Payment was never sent',
+  );
+  assert.throws(() => completePayment(db, pending.id, today(), 'owner'), /cancelled payment/);
+  assert.equal(
+    db.prepare("SELECT COUNT(*) n FROM audit_log WHERE action='Pending payment cancelled'").get().n,
+    1,
+  );
+  cancelPayment(db, pending.id, 'Retried cancellation', 'owner');
+  assert.equal(
+    db.prepare("SELECT COUNT(*) n FROM audit_log WHERE action='Pending payment cancelled'").get().n,
+    1,
+  );
+  db.close();
+});
+
+test('payment completion revalidates a changed balance and is idempotent', () => {
+  const db = fixture(),
+    o = order(db, 'p500', 'Confirmed', 'Prepaid');
+  const pending = pay(db, o, 'Prepaid payment', 40000, { status: 'Pending' });
+  db.prepare('UPDATE orders SET total=30000 WHERE id=?').run(o.id);
+  assert.throws(() => completePayment(db, pending.id, today(), 'owner'), /outstanding balance/);
+  assert.equal(
+    db.prepare('SELECT status FROM payments WHERE id=?').get(pending.id).status,
+    'Pending',
+  );
+  db.prepare('UPDATE orders SET total=100000 WHERE id=?').run(o.id);
+  completePayment(db, pending.id, today(), 'owner');
+  completePayment(db, pending.id, today(), 'owner');
+  assert.equal(
+    db.prepare("SELECT COUNT(*) n FROM audit_log WHERE action='Payment completed'").get().n,
+    1,
+  );
+  assert.throws(
+    () => cancelPayment(db, pending.id, 'Wrong payment', 'owner'),
+    /Completed payments cannot/,
+  );
+  db.close();
+});
+
+test('cancelled supplier reservations no longer block eligible credit use', () => {
+  const db = fixture(),
+    returned = order(db, 'p500', 'RTO'),
+    purchase = order(db, 'p300');
+  credit(db, returned);
+  const pending = pay(db, purchase, 'Supplier payment', 30000, {
+    supplier_id: 'A',
+    status: 'Pending',
+  });
+  assert.throws(() => apply(db, purchase, 30000), /unpaid purchase/);
+  cancelPayment(db, pending.id, 'Use supplier credit instead', 'owner');
+  apply(db, purchase, 30000);
+  assert.equal(supplierBalance(db, 'A'), 20000);
+  assert.throws(() => completePayment(db, pending.id, today(), 'owner'), /cancelled payment/);
+  db.close();
+});
+
+test('product contribution uses each product cost and reconciles shared expenses exactly', () => {
+  const db = fixture();
+  const o = createOrder(
+    db,
+    {
+      date: today(),
+      customer: 'Mixed cost customer',
+      method: 'COD',
+      status: 'Delivered',
+      shipping_cost: 101,
+      items: [
+        { product_id: 'p500', quantity: 1, price: 100000 },
+        { product_id: 'p300', quantity: 1, price: 100000 },
+      ],
+    },
+    'owner',
+  );
+  const state = workspace(db),
+    a = state.products.find((p) => p.id === 'p500'),
+    b = state.products.find((p) => p.id === 'p300');
+  assert.equal(a.profit, 49949);
+  assert.equal(b.profit, 69950);
+  assert.equal(a.profit + b.profit, state.orders.find((x) => x.id === o.id).profit);
+  assert.equal(a.revenue + b.revenue, state.metrics.sales);
+  db.close();
+});
+
+test('RTO product recovery belongs only to the supplier that issued the credit', () => {
+  const db = fixture();
+  const o = createOrder(
+    db,
+    {
+      date: today(),
+      customer: 'Supplier return',
+      method: 'COD',
+      status: 'RTO',
+      shipping_cost: 10000,
+      items: [
+        { product_id: 'p500', quantity: 1, price: 100000 },
+        { product_id: 'pB', quantity: 1, price: 100000 },
+      ],
+    },
+    'owner',
+  );
+  credit(db, o, 30000, 'A');
+  const state = workspace(db);
+  assert.equal(state.products.find((p) => p.id === 'p500').profit, -25000);
+  assert.equal(state.products.find((p) => p.id === 'pB').profit, -35000);
+  assert.equal(
+    state.products.reduce((s, p) => s + p.profit, 0),
+    state.metrics.grossProfit,
+  );
+  db.close();
+});
+
+test('paise allocation conserves totals for refunds, zero prices and large unequal weights', () => {
+  assert.deepEqual(allocatePaise(2, [1, 1, 1]), [1, 1, 0]);
+  assert.deepEqual(allocatePaise(-2, [1, 1, 1]), [-1, -1, 0]);
+  assert.deepEqual(allocatePaise(5, [0, 0]), [3, 2]);
+  for (const total of [1, 99, 100000000001]) {
+    const result = allocatePaise(total, [987654321, 123456789, 777777777]);
+    assert.equal(
+      result.reduce((a, b) => a + b, 0),
+      total,
+    );
+    assert.ok(result.every(Number.isInteger));
+  }
+});
+
+test('payment summaries follow settlement dates even for orders outside the selected cohort', () => {
+  const db = fixture(),
+    o = order(db, 'p500', 'Delivered');
+  db.prepare("UPDATE orders SET date='2020-01-01' WHERE id=?").run(o.id);
+  pay(db, o, 'COD remittance', 20000);
+  const state = workspace(db, today(), today());
+  assert.equal(state.metrics.codRemitted, 0);
+  assert.equal(state.paymentMetrics.codRemitted, 20000);
+  assert.equal(state.paymentMetrics.codPending, 80000);
+  db.close();
+});
+
+test('provider payments cannot be completed or cancelled manually', () => {
+  const db = fixture(),
+    o = order(db, 'p500', 'Confirmed', 'Prepaid');
+  const pending = pay(db, o, 'Prepaid payment', 10000, { status: 'Pending' });
+  db.prepare("UPDATE payments SET source='Shopify' WHERE id=?").run(pending.id);
+  assert.throws(
+    () => completePayment(db, pending.id, today(), 'owner'),
+    /managed by their provider/,
+  );
+  assert.throws(
+    () => cancelPayment(db, pending.id, 'Operator cancellation', 'owner'),
+    /managed by their provider/,
+  );
   db.close();
 });

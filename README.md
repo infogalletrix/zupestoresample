@@ -2,6 +2,15 @@
 
 A working local commerce operations application built in this folder from the supplied requirements and dashboard reference. React + TypeScript, Express, and SQLite. Amounts are stored as integer paise. Fonts and application assets are served locally.
 
+## Version 1.1: daily operations
+
+- Locally served Inter typography, improved contrast, larger controls, mobile quick navigation and dark mode.
+- A dashboard work queue for NDR, pending supplier credits, pending payments and unverified costs. These actions include all dates and open the relevant work list.
+- Search orders (including customer/phone), products and suppliers from anywhere. Table searches remain editable, with sorting and a rows-per-page control.
+- Payment forms display the remaining amount after completed payments, pending reservations and supplier credit. Completion rechecks balances and records the actual payment date. Pending manual payments can be cancelled with an audit reason; completed/provider transactions cannot be cancelled this way.
+- Supplier credit use no longer blocks fulfilment. Manual delivered, RTO and cancelled orders cannot be reversed into an earlier state; supplier credit and payment history remain protected.
+- Product contribution uses historical item costs and supplier-specific return recoveries, with exact paise allocation for shared revenue and shipping. Workspace aggregation groups related records once instead of repeatedly scanning all rows for every order.
+
 ## Open the app
 
 Requirements: **Node.js 22.13+** and npm. Node 22 may print an experimental SQLite warning; the application uses Node's built-in `node:sqlite` database.
@@ -61,11 +70,11 @@ The test suite covers the supplied example: receive ₹500, apply ₹300, retain
 - **Gross profit:** recognized revenue minus net product costs, shipping, and RTO charges.
 - **Net profit:** gross profit minus manual expenses, including Meta Ads.
 - **Order net profit:** order contribution minus an equal allocation of manual expenses in the selected period. Remainder paise are allocated deterministically, so order totals reconcile to the period P&L whenever the period contains orders.
-- **Product contribution:** shared order revenue, shipping and contribution allocated by selling value. This excludes shared period overhead; it is labelled contribution in the UI.
+- **Product contribution:** allocated order revenue minus each item's historical product cost and allocated shipping/return charges, plus the item's supplier-specific RTO recovery. Shared amounts use selling values and largest-remainder allocation so paise reconcile exactly; zero-priced lines share equally. A supplier's recovery is allocated only to that supplier's items, by cost. This excludes shared period overhead.
 - **COD pending:** collected COD minus completed remittances. Delivery alone never marks a remittance complete. Pending payment records reserve payable but do not count as completed receipts.
 - **RTO rate:** RTO orders divided by dispatched orders; confirmed and cancelled orders are excluded from the denominator.
 - Reports use **order-date cohorts and current known order outcomes**, with expenses by expense date. These are operational management reports, not a statutory general ledger or GST filing system. A prior cohort can change when its deliveries, returns or refunds arrive.
-- Payment ledger date filters apply to **payment dates**. Payment summary cards use the selected **order cohort**. Supplier credit summary balances are **all time**, even when ledger/chart activity is filtered.
+- Payment ledger filters and its collected/remitted/prepaid cards use **payment dates**. The Payments page's COD pending card shows the outstanding balance **across all dates**. Dashboard payment metrics retain the selected order cohort. Supplier credit summary balances are **all time**, even when ledger/chart activity is filtered.
 - Unknown costs are flagged as provisional. Review imported supplier assignments, costs, shipping invoices and RTO charges before relying on profit. A missing shipping cost is not treated as a verified free shipment.
 - Manual expenses are **additional** costs. Do not re-enter product/shipping costs already recorded against an order. Do not add customer collection and remittance figures together as cash income.
 - Remittance amounts represent the **gross order balance cleared**. If a provider deducts already-recorded freight or fees from bank settlement, reconcile the deductions and allocate the gross cleared order amount; this version does not calculate a bank balance or import bank statements.
@@ -177,7 +186,7 @@ docker compose up -d --build --wait
 curl --fail http://127.0.0.1:3107/api/health
 ```
 
-Install `deploy/zupestore.nginx.conf` as a new virtual host for this domain, check `nginx -t`, and reload Nginx. With DNS pointing to the VPS, issue its certificate using `certbot --nginx -d zupestore.galletrix.com --redirect`. Keep the Certbot renewal timer enabled. On the HTTPS site, expand **Have a hosting setup token?** and use the token from the server's `.env` when creating the first administrator. Choose your own email and password; no default administrator account is installed.
+Install `deploy/zupestore.nginx.conf` as a new virtual host for this domain, check `nginx -t`, and reload Nginx. With DNS pointing to the VPS, issue its certificate using `certbot --nginx -d zupestore.galletrix.com --redirect`. Keep the Certbot renewal timer enabled. On the HTTPS site, enter the token from the server's `.env` in **Hosting setup token** when creating the first administrator. Choose your own email and password; no default administrator account is installed.
 
 For updates, run `git pull --ff-only` and `docker compose up -d --build --wait` in `/opt/zupestore`. Back up the live database through **Settings > Backup & export** and preserve the volume's `.encryption-key` separately before updating. Do not remove the data volume. Shopify, Shiprocket and settlement credentials are configured by the administrator in the app after deployment.
 
@@ -188,7 +197,9 @@ npm run check
 npm audit
 ```
 
-`npm run check` builds the TypeScript frontend and runs backend, integration-contract, and component interaction tests. Tests cover the exact RTO example, supplier boundaries, over-credit/overpayment, duplicate events, partial COD settlement, role enforcement, encryption, HMAC validation, pagination, cost snapshots, tax/refunds, spreadsheet safety and real credit-form submissions. Provider calls are mocked; they are not live-account acceptance tests. Component tests use jsdom; visual desktop/mobile QA requires a real browser. Browser-control tools were unavailable during this implementation session.
+`npm run check` builds the TypeScript frontend and runs backend, integration-contract, and component interaction tests. Tests cover the exact RTO example, supplier boundaries, over-credit/overpayment, duplicate events, partial COD settlement, role enforcement, encryption, HMAC validation, pagination, cost snapshots, tax/refunds, spreadsheet safety and real credit-form submissions. Provider calls are mocked; they are not live-account acceptance tests.
+
+For real-browser validation, run `npx playwright install chromium`, then `npm run check` and `npm run test:browser`. The browser suite uses an isolated temporary database and checks all main screens at desktop, tablet and mobile sizes, along with editable search, dark mode, date filters, pending-payment completion/cancellation and protected owner setup. Screenshots are saved under the Git-ignored `artifacts/browser-screenshots` directory.
 
 | Path                      | Purpose                                                      |
 | ------------------------- | ------------------------------------------------------------ |

@@ -26,6 +26,14 @@ export const categories = [
   'Other expenses',
 ];
 export const orderStatuses = ['Confirmed', 'Shipped', 'Delivered', 'NDR', 'RTO', 'Cancelled'];
+export const manualTransitions = {
+  Confirmed: ['Shipped', 'Delivered', 'NDR', 'RTO', 'Cancelled'],
+  Shipped: ['Delivered', 'NDR', 'RTO'],
+  NDR: ['Shipped', 'Delivered', 'RTO'],
+  Delivered: [],
+  RTO: [],
+  Cancelled: [],
+};
 export const today = () =>
   new Intl.DateTimeFormat('en-CA', {
     timeZone: 'Asia/Kolkata',
@@ -131,11 +139,21 @@ function ledgerSum(db, orderId, supplierId, type) {
     )
     .get(orderId, supplierId, type).amount;
 }
-function paymentSum(db, orderId, kind, supplierId = null, includePending = false) {
-  const rows = db.prepare('SELECT * FROM payments WHERE order_id=? AND kind=?').all(orderId, kind);
+function paymentSum(
+  db,
+  orderId,
+  kind,
+  supplierId = null,
+  includePending = false,
+  excludeId = null,
+) {
+  const rows = db
+    .prepare('SELECT * FROM payments WHERE order_id=? AND kind=? AND voided_at IS NULL')
+    .all(orderId, kind);
   return rows
     .filter(
       (r) =>
+        r.id !== excludeId &&
         (includePending || r.status === 'Completed') &&
         (!supplierId || r.supplier_id === supplierId),
     )
@@ -158,6 +176,9 @@ function checkReplay(previous, data, type) {
     (previous.order_id !== data.order_id ||
       previous.supplier_id !== data.supplier_id ||
       previous.amount !== data.amount ||
+      previous.date !== data.date ||
+      previous.reference !== data.reference ||
+      previous.notes !== data.notes ||
       previous.type !== type)
   )
     throw new AppError('This request key was already used for a different ledger entry.', 409);
@@ -242,6 +263,59 @@ export function useCredit(db, input, actor) {
     return row;
   });
 }
+function validatePayment(db, d, excludeId = null) {
+  const order = db.prepare('SELECT * FROM orders WHERE id=?').get(d.order_id);
+  if (!order) throw new AppError('Order not found.');
+  if (d.date < order.date || d.date > today())
+    throw new AppError('Payment date must be between the order date and today.');
+  if (order.source === 'Shopify' && ['Prepaid payment', 'Customer refund'].includes(d.kind))
+    throw new AppError(
+      'Manage prepaid payments and refunds for this order in Shopify. They synchronize automatically.',
+    );
+  if (d.tax_amount > 0 && d.kind !== 'Customer refund')
+    throw new AppError('Refund tax is only valid for customer refunds.');
+  if (d.tax_amount > d.amount) throw new AppError('Refund tax cannot exceed the refund amount.');
+  if (
+    db
+      .prepare('SELECT id FROM payments WHERE order_id=? AND kind=? AND reference=? AND id!=?')
+      .get(d.order_id, d.kind, d.reference, excludeId || '')
+  )
+    throw new AppError('This payment reference has already been recorded for this order.');
+  if (order.status === 'Cancelled' && ['Supplier payment', 'Prepaid payment'].includes(d.kind))
+    throw new AppError('This order is cancelled. Record a refund instead of a new payment.');
+  if (d.kind !== 'Supplier payment' && d.supplier_id)
+    throw new AppError('Only supplier payments can have a supplier.');
+  let limit;
+  if (d.kind === 'COD remittance') {
+    if (order.method !== 'COD') throw new AppError('Select a COD order.');
+    limit =
+      paymentSum(db, order.id, 'COD collected') -
+      paymentSum(db, order.id, d.kind, null, true, excludeId);
+  } else if (d.kind === 'Prepaid payment') {
+    if (order.method !== 'Prepaid') throw new AppError('Select a prepaid order.');
+    limit = order.total - paymentSum(db, order.id, d.kind, null, true, excludeId);
+  } else if (d.kind === 'Supplier payment') {
+    if (!d.supplier_id) throw new AppError('Select a supplier.');
+    limit =
+      supplierOrderCost(db, order.id, d.supplier_id) -
+      ledgerSum(db, order.id, d.supplier_id, 'Credit used') -
+      paymentSum(db, order.id, d.kind, d.supplier_id, true, excludeId);
+  } else {
+    limit =
+      paymentSum(db, order.id, 'Prepaid payment') +
+      paymentSum(db, order.id, 'COD collected') -
+      paymentSum(db, order.id, 'Customer refund', null, true, excludeId);
+    const refundedTax = db
+      .prepare(
+        "SELECT COALESCE(SUM(tax_amount),0) AS amount FROM payments WHERE order_id=? AND kind='Customer refund' AND voided_at IS NULL AND id!=?",
+      )
+      .get(order.id, excludeId || '').amount;
+    if (d.tax_amount > Math.max(0, order.tax - refundedTax))
+      throw new AppError('Refund tax exceeds the remaining tax on this order.');
+  }
+  if (d.amount > limit)
+    throw new AppError('Amount exceeds the outstanding balance for this payment.');
+}
 export function recordPayment(db, input, actor) {
   const d = schemas.payment.parse(input);
   return transaction(db, () => {
@@ -249,60 +323,14 @@ export function recordPayment(db, input, actor) {
     const old = db.prepare('SELECT * FROM payments WHERE external_key=?').get(externalKey);
     if (old) {
       if (
-        old.amount !== d.amount ||
-        old.order_id !== d.order_id ||
-        old.kind !== d.kind ||
-        old.reference !== d.reference
+        ['amount', 'order_id', 'supplier_id', 'kind', 'reference', 'tax_amount'].some(
+          (key) => old[key] !== d[key],
+        )
       )
         throw new AppError('This event was already used for a different payment.', 409);
       return old;
     }
-    const order = db.prepare('SELECT * FROM orders WHERE id=?').get(d.order_id);
-    if (!order) throw new AppError('Order not found.');
-    if (d.date < order.date || d.date > today())
-      throw new AppError('Payment date must be between the order date and today.');
-    if (order.source === 'Shopify' && ['Prepaid payment', 'Customer refund'].includes(d.kind))
-      throw new AppError(
-        'Manage prepaid payments and refunds for this order in Shopify. They synchronize automatically.',
-      );
-    if (d.tax_amount > 0 && d.kind !== 'Customer refund')
-      throw new AppError('Refund tax is only valid for customer refunds.');
-    if (d.tax_amount > d.amount) throw new AppError('Refund tax cannot exceed the refund amount.');
-    if (
-      db
-        .prepare('SELECT id FROM payments WHERE order_id=? AND kind=? AND reference=?')
-        .get(d.order_id, d.kind, d.reference)
-    )
-      throw new AppError('This payment reference has already been recorded for this order.');
-    let limit;
-    if (d.kind === 'COD remittance') {
-      if (order.method !== 'COD') throw new AppError('Select a COD order.');
-      limit =
-        paymentSum(db, order.id, 'COD collected') - paymentSum(db, order.id, d.kind, null, true);
-    } else if (d.kind === 'Prepaid payment') {
-      if (order.method !== 'Prepaid') throw new AppError('Select a prepaid order.');
-      limit = order.total - paymentSum(db, order.id, d.kind, null, true);
-    } else if (d.kind === 'Supplier payment') {
-      if (!d.supplier_id) throw new AppError('Select a supplier.');
-      limit =
-        supplierOrderCost(db, order.id, d.supplier_id) -
-        ledgerSum(db, order.id, d.supplier_id, 'Credit used') -
-        paymentSum(db, order.id, d.kind, d.supplier_id, true);
-    } else {
-      limit =
-        paymentSum(db, order.id, 'Prepaid payment') +
-        paymentSum(db, order.id, 'COD collected') -
-        paymentSum(db, order.id, 'Customer refund', null, true);
-      const refundedTax = db
-        .prepare(
-          "SELECT COALESCE(SUM(tax_amount),0) AS amount FROM payments WHERE order_id=? AND kind='Customer refund'",
-        )
-        .get(order.id).amount;
-      if (d.tax_amount > Math.max(0, order.tax - refundedTax))
-        throw new AppError('Refund tax exceeds the remaining tax on this order.');
-    }
-    if (d.amount > limit)
-      throw new AppError('Amount exceeds the outstanding balance for this payment.');
+    validatePayment(db, d);
     const { idempotency_key, ...fields } = d;
     const row = insert(db, 'payments', {
       ...fields,
@@ -315,6 +343,43 @@ export function recordPayment(db, input, actor) {
     return row;
   });
 }
+export function completePayment(db, paymentId, inputDate, actor) {
+  return transaction(db, () => {
+    const row = db.prepare('SELECT * FROM payments WHERE id=?').get(paymentId);
+    if (!row) throw new AppError('Payment not found.', 404);
+    if (row.source !== 'Manual')
+      throw new AppError('Synced transactions are managed by their provider.', 409);
+    if (row.voided_at) throw new AppError('A cancelled payment cannot be completed.', 409);
+    if (row.status === 'Completed') return row;
+    const completedDate = date.parse(inputDate || today());
+    validatePayment(db, { ...row, date: completedDate }, row.id);
+    db.prepare("UPDATE payments SET status='Completed',date=? WHERE id=?").run(
+      completedDate,
+      row.id,
+    );
+    audit(db, actor, 'Payment completed', row.id, { amount: row.amount, date: completedDate });
+    return { ...row, status: 'Completed', date: completedDate };
+  });
+}
+export function cancelPayment(db, paymentId, reason, actor) {
+  return transaction(db, () => {
+    const row = db.prepare('SELECT * FROM payments WHERE id=?').get(paymentId);
+    if (!row) throw new AppError('Payment not found.', 404);
+    if (row.source !== 'Manual')
+      throw new AppError('Synced transactions are managed by their provider.', 409);
+    if (row.voided_at) return { ...row, status: 'Cancelled' };
+    if (row.status !== 'Pending')
+      throw new AppError(
+        'Completed payments cannot be cancelled. Record a refund where appropriate.',
+        409,
+      );
+    const note = text.min(3).parse(reason);
+    const at = now();
+    db.prepare('UPDATE payments SET voided_at=?,void_reason=? WHERE id=?').run(at, note, row.id);
+    audit(db, actor, 'Pending payment cancelled', row.id, { amount: row.amount, reason: note });
+    return { ...row, status: 'Cancelled', voided_at: at, void_reason: note };
+  });
+}
 export function collectCod(db, orderId, onDate = today()) {
   const order = db.prepare('SELECT * FROM orders WHERE id=?').get(orderId);
   if (order?.status === 'Delivered' && order.method === 'COD' && order.total > 0) {
@@ -325,6 +390,7 @@ export function collectCod(db, orderId, onDate = today()) {
 }
 export function createOrder(db, input, actor) {
   const d = schemas.order.parse(input);
+  if (d.date > today()) throw new AppError('An order date cannot be in the future.');
   return transaction(db, () => {
     const items = d.items.map((line) => {
       const p = db.prepare('SELECT * FROM products WHERE id=?').get(line.product_id);
@@ -344,7 +410,7 @@ export function createOrder(db, input, actor) {
       city: d.city,
       method: d.method,
       status: d.status,
-      total: items.reduce((s, l) => s + l.price * l.quantity, 0) + d.tax,
+      total: money.parse(items.reduce((s, l) => s + l.price * l.quantity, 0) + d.tax),
       tax: d.tax,
       shipping_cost: d.shipping_cost,
       rto_cost: d.rto_cost,
@@ -386,23 +452,62 @@ export function createOrder(db, input, actor) {
   });
 }
 
+// Allocate integer paise with largest remainders; no rounding drift between products.
+export function allocatePaise(total, weights) {
+  if (!weights.length) return [];
+  const sign = total < 0 ? -1 : 1;
+  const amount = BigInt(Math.abs(total));
+  let basis = weights.map((w) => BigInt(Math.max(0, w)));
+  if (basis.every((w) => w === 0n)) basis = basis.map(() => 1n);
+  const divisor = basis.reduce((sum, w) => sum + w, 0n);
+  const shares = basis.map((w, index) => ({
+    index,
+    value: Number((amount * w) / divisor),
+    remainder: (amount * w) % divisor,
+  }));
+  let remaining = Math.abs(total) - shares.reduce((sum, r) => sum + r.value, 0);
+  for (const r of [...shares].sort((a, b) =>
+    a.remainder === b.remainder ? a.index - b.index : a.remainder > b.remainder ? -1 : 1,
+  )) {
+    if (!remaining) break;
+    r.value++;
+    remaining--;
+  }
+  return shares.map((r) => (r.value === 0 ? 0 : sign * r.value));
+}
+function groupBy(rows, key) {
+  const map = new Map();
+  for (const row of rows) {
+    if (!map.has(row[key])) map.set(row[key], []);
+    map.get(row[key]).push(row);
+  }
+  return map;
+}
+
 export function workspace(db, from = '0000-01-01', to = '9999-12-31') {
   const suppliers = db.prepare('SELECT * FROM suppliers ORDER BY name').all();
   const products = db.prepare('SELECT * FROM products ORDER BY name').all();
   const items = db.prepare('SELECT * FROM order_items').all();
   const shipments = db.prepare('SELECT * FROM shipments ORDER BY updated_at DESC').all();
-  const payments = db.prepare('SELECT * FROM payments ORDER BY date DESC,created_at DESC').all();
+  const payments = db
+    .prepare('SELECT * FROM payments ORDER BY date DESC,created_at DESC')
+    .all()
+    .map((p) => ({ ...p, status: p.voided_at ? 'Cancelled' : p.status }));
   const ledger = db.prepare('SELECT * FROM credit_ledger ORDER BY date DESC,created_at DESC').all();
   const expenses = db.prepare('SELECT * FROM expenses ORDER BY date DESC,created_at DESC').all();
   const between = (r) => r.date >= from && r.date <= to;
+  const itemsByOrder = groupBy(items, 'order_id'),
+    paymentsByOrder = groupBy(payments, 'order_id'),
+    ledgerByOrder = groupBy(ledger, 'order_id'),
+    shipmentsByOrder = groupBy(shipments, 'order_id');
   const orders = db
     .prepare('SELECT * FROM orders ORDER BY date DESC,number DESC')
     .all()
     .map((o) => {
-      const lines = items.filter((i) => i.order_id === o.id);
-      const pay = payments.filter((p) => p.order_id === o.id && p.status === 'Completed');
+      const lines = itemsByOrder.get(o.id) || [];
+      const pay = (paymentsByOrder.get(o.id) || []).filter((p) => p.status === 'Completed');
       const sum = (k) => pay.filter((p) => p.kind === k).reduce((s, p) => s + p.amount, 0);
-      const credits = ledger.filter((l) => l.order_id === o.id);
+      const credits = ledgerByOrder.get(o.id) || [];
       const cost = lines.reduce((s, i) => s + i.cost * i.quantity, 0);
       const costRecovery = credits
         .filter((l) => l.type === 'Credit added')
@@ -425,7 +530,11 @@ export function workspace(db, from = '0000-01-01', to = '9999-12-31') {
       return {
         ...o,
         items: lines,
-        shipments: shipments.filter((s) => s.order_id === o.id),
+        shipments: shipmentsByOrder.get(o.id) || [],
+        allowed_statuses: [
+          o.status,
+          ...(o.source === 'Manual' ? manualTransitions[o.status] || [] : []),
+        ],
         product_cost: cost,
         credit_received: costRecovery,
         credit_used: used,
@@ -506,31 +615,45 @@ export function workspace(db, from = '0000-01-01', to = '9999-12-31') {
       products: products.filter((p) => p.supplier_id === s.id).length,
     };
   });
-  const productRows = products.map((p) => {
-    let revenue = 0,
-      profit = 0,
-      count = 0,
-      quantity = 0;
-    selected.forEach((o) => {
-      const lines = o.items.filter((i) => i.product_id === p.id);
-      if (!lines.length) return;
-      count++;
-      quantity += lines.reduce((s, i) => s + i.quantity, 0);
-      const lineWeight = lines.reduce((s, i) => s + i.price * i.quantity, 0),
-        totalWeight = o.items.reduce((s, i) => s + i.price * i.quantity, 0);
-      const w = totalWeight ? lineWeight / totalWeight : lines.length / o.items.length;
-      revenue += Math.round(o.revenue * w);
-      profit += Math.round(o.profit * w);
+  const productTotals = new Map(
+    products.map((p) => [p.id, { revenue: 0, profit: 0, orders: 0, quantity: 0 }]),
+  );
+  for (const o of selected) {
+    const weights = o.items.map((i) => i.price * i.quantity);
+    const revenue = allocatePaise(o.revenue, weights);
+    const shipping = allocatePaise(o.shipping_cost + o.rto_cost, weights);
+    const recovery = o.items.map(() => 0);
+    for (const entry of (ledgerByOrder.get(o.id) || []).filter((l) => l.type === 'Credit added')) {
+      const indexes = o.items
+        .map((line, i) => (line.supplier_id === entry.supplier_id ? i : -1))
+        .filter((i) => i >= 0);
+      const shares = allocatePaise(
+        entry.amount,
+        indexes.map((i) => o.items[i].cost * o.items[i].quantity),
+      );
+      indexes.forEach((i, j) => (recovery[i] += shares[j]));
+    }
+    const seen = new Set();
+    o.items.forEach((line, i) => {
+      const row = productTotals.get(line.product_id);
+      if (!row) return;
+      row.revenue += revenue[i];
+      row.profit +=
+        revenue[i] -
+        (['Confirmed', 'Cancelled'].includes(o.status) ? 0 : line.cost * line.quantity) +
+        recovery[i] -
+        shipping[i];
+      row.quantity += line.quantity;
+      if (!seen.has(line.product_id)) row.orders++;
+      seen.add(line.product_id);
     });
-    return {
-      ...p,
-      supplier: suppliers.find((s) => s.id === p.supplier_id)?.name || 'Unassigned',
-      orders: count,
-      quantity,
-      revenue,
-      profit,
-    };
-  });
+  }
+  const supplierNames = new Map(suppliers.map((s) => [s.id, s.name]));
+  const productRows = products.map((p) => ({
+    ...p,
+    supplier: supplierNames.get(p.supplier_id) || 'Unassigned',
+    ...productTotals.get(p.id),
+  }));
   const timeline = new Map();
   selected.forEach((o) => {
     if (!timeline.has(o.date))
@@ -569,6 +692,18 @@ export function workspace(db, from = '0000-01-01', to = '9999-12-31') {
     payments,
     ledger,
     shipments,
+    paymentMetrics: {
+      codCollected: payments
+        .filter((p) => between(p) && p.status === 'Completed' && p.kind === 'COD collected')
+        .reduce((s, p) => s + p.amount, 0),
+      codRemitted: payments
+        .filter((p) => between(p) && p.status === 'Completed' && p.kind === 'COD remittance')
+        .reduce((s, p) => s + p.amount, 0),
+      prepaid: payments
+        .filter((p) => between(p) && p.status === 'Completed' && p.kind === 'Prepaid payment')
+        .reduce((s, p) => s + p.amount, 0),
+      codPending: sum(orders, 'cod_pending'),
+    },
     metrics: {
       totalOrders: selected.length,
       confirmed: statusCounts.Confirmed,

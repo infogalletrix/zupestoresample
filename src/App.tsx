@@ -4,7 +4,6 @@ import {
   Bell,
   ChevronDown,
   CircleHelp,
-  Command,
   CreditCard,
   LayoutDashboard,
   LogOut,
@@ -27,9 +26,10 @@ import {
   CheckCircle2,
   LoaderCircle,
 } from 'lucide-react';
-import { api, makePeriod } from './lib';
+import { api, ApiError, makePeriod } from './lib';
 import type { ModalState, Page, Period, Session, Workspace } from './types';
 import { DatePicker, Notice } from './components';
+import { WorkspaceSearch } from './WorkspaceSearch';
 import { AuthScreen, ModalForms } from './Forms';
 import {
   Customers,
@@ -76,12 +76,15 @@ function initialPage(): Page {
 }
 
 export default function App() {
-  const [auth, setAuth] = useState<{ session: Session | null; needsSetup: boolean } | null>(null),
+  const [auth, setAuth] = useState<{
+      session: Session | null;
+      needsSetup: boolean;
+      setupTokenRequired?: boolean;
+    } | null>(null),
     [data, setData] = useState<Workspace | null>(null),
     [period, setPeriod] = useState<Period>(() => makePeriod('Last 30 days')),
     [page, setPage] = useState<Page>(initialPage),
     [search, setSearch] = useState(''),
-    [globalSearch, setGlobalSearch] = useState(''),
     [modal, setModal] = useState<ModalState>(null),
     [mobileOpen, setMobileOpen] = useState(false),
     [userMenu, setUserMenu] = useState(false),
@@ -99,7 +102,12 @@ export default function App() {
     toastTimer.current = setTimeout(() => setToast(null), 6500);
   }, []);
   const checkAuth = useCallback(async () => {
-    const result = await api<{ session: Session | null; needsSetup: boolean }>('/auth/session');
+    ++requestSeq.current;
+    const result = await api<{
+      session: Session | null;
+      needsSetup: boolean;
+      setupTokenRequired?: boolean;
+    }>('/auth/session');
     setAuth(result);
     setData(null);
   }, []);
@@ -122,7 +130,13 @@ export default function App() {
         }
         if (message) notify(message);
       } catch (e) {
-        setError((e as Error).message);
+        if (seq === requestSeq.current) {
+          if (e instanceof ApiError && e.status === 401) {
+            ++requestSeq.current;
+            setData(null);
+            setAuth({ session: null, needsSetup: false });
+          } else setError((e as Error).message);
+        }
         throw e;
       } finally {
         if (seq === requestSeq.current) setLoading(false);
@@ -147,6 +161,11 @@ export default function App() {
   }, []);
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setMobileOpen(false);
+        setUserMenu(false);
+        setNotifications(false);
+      }
       if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
         e.preventDefault();
         document.querySelector<HTMLInputElement>('[aria-label="Search workspace"]')?.focus();
@@ -157,15 +176,23 @@ export default function App() {
   }, []);
   const navigate = useCallback((next: Page, query = '') => {
     setPage(next);
+    if (query.startsWith('needs:')) setPeriod(makePeriod('All time'));
     setSearch(query);
-    setGlobalSearch(query);
     history.pushState(null, '', `#/${next}`);
     setMobileOpen(false);
     setNotifications(false);
     window.scrollTo({ top: 0 });
   }, []);
   const closeModal = useCallback(() => setModal(null), []);
+  useEffect(() => {
+    if (!search.startsWith('needs:')) return;
+    const frame = requestAnimationFrame(() =>
+      document.querySelector('main .tabs')?.scrollIntoView({ block: 'start' }),
+    );
+    return () => cancelAnimationFrame(frame);
+  }, [page, search]);
   async function logout() {
+    ++requestSeq.current;
     await api('/auth/logout', { method: 'POST' });
     setUserMenu(false);
     setModal(null);
@@ -193,7 +220,14 @@ export default function App() {
         )}
       </div>
     );
-  if (!session) return <AuthScreen needsSetup={auth.needsSetup} onLogin={checkAuth} />;
+  if (!session)
+    return (
+      <AuthScreen
+        needsSetup={auth.needsSetup}
+        setupTokenRequired={auth.setupTokenRequired}
+        onLogin={checkAuth}
+      />
+    );
   const Screen = pageMap[page],
     label = page === 'settings' ? 'Settings' : nav.find((n) => n.id === page)?.label;
   const attention = data
@@ -224,10 +258,9 @@ export default function App() {
         <div className="workspace-switcher">
           <span className="workspace-avatar">{(data?.business.name || 'Zupestore')[0]}</span>
           <div>
-            <strong>{session.demo ? 'Demo store' : 'My store'}</strong>
+            <strong>{session.demo ? 'Demo store' : data?.business.name || 'Zupestore'}</strong>
             <span>{session.demo ? 'Sample workspace' : 'Business workspace'}</span>
           </div>
-          <ChevronDown size={13} />
         </div>
         <div className="nav-section-label">WORKSPACE</div>
         <nav>
@@ -237,6 +270,7 @@ export default function App() {
               <button
                 className={`nav-item ${page === item.id ? 'active' : ''}`}
                 onClick={() => navigate(item.id)}
+                aria-current={page === item.id ? 'page' : undefined}
               >
                 <item.icon size={18} />
                 <span>{item.label}</span>
@@ -280,7 +314,7 @@ export default function App() {
           </button>
           <div className="sidebar-version">
             <span className="live-dot" />
-            Zupestore<span>v1.0</span>
+            Zupestore<span>v1.1</span>
           </div>
         </div>
       </aside>
@@ -299,27 +333,7 @@ export default function App() {
               <strong>{label}</strong>
             </div>
           </div>
-          <form
-            className="global-search"
-            onSubmit={(e) => {
-              e.preventDefault();
-              navigate('orders', globalSearch);
-            }}
-          >
-            <Search size={17} />
-            <input
-              value={globalSearch}
-              onChange={(e) => {
-                setGlobalSearch(e.target.value);
-                if (!e.target.value) setSearch('');
-              }}
-              placeholder="Search orders, customers, products…"
-              aria-label="Search workspace"
-            />
-            <span>
-              <Command size={11} /> K
-            </span>
-          </form>
+          <WorkspaceSearch data={data} page={page} navigate={navigate} open={setModal} />
           <div className="topbar-actions">
             <button
               className="icon-button theme-button"
@@ -398,6 +412,7 @@ export default function App() {
             <div className="user-control">
               <button
                 className="user-button"
+                aria-label="Account menu"
                 onClick={() => {
                   setUserMenu(!userMenu);
                   setNotifications(false);
@@ -436,6 +451,15 @@ export default function App() {
                     >
                       <Settings2 size={16} />
                       Workspace settings
+                    </button>
+                    <button
+                      onClick={() => {
+                        setTheme(theme === 'light' ? 'dark' : 'light');
+                        setUserMenu(false);
+                      }}
+                    >
+                      {theme === 'light' ? <Moon size={16} /> : <Sun size={16} />}
+                      {theme === 'light' ? 'Dark mode' : 'Light mode'}
                     </button>
                     <button onClick={() => logout().catch((e) => notify(e.message, true))}>
                       <LogOut size={16} />
@@ -483,15 +507,23 @@ export default function App() {
               </button>
             </div>
           </div>
-          {search && (
+          {search.startsWith('needs:') && (
             <div className="active-search">
               <Search size={14} />
-              Showing matches for <strong>“{search}”</strong>
+              <strong>
+                {(
+                  {
+                    'needs:ndr': 'Delivery issues',
+                    'needs:cost': 'Unverified order costs',
+                    'needs:credit': 'Pending supplier credits',
+                    'needs:payment': 'Pending payments',
+                  } as Record<string, string>
+                )[search] || `Search: ${search}`}
+              </strong>
               <button
                 className="text-button"
                 onClick={() => {
                   setSearch('');
-                  setGlobalSearch('');
                 }}
               >
                 Clear <X size={13} />
@@ -507,7 +539,7 @@ export default function App() {
             </Notice>
           )}
           {pageProps ? (
-            <Screen {...pageProps} />
+            <Screen key={page} {...pageProps} />
           ) : (
             <div className="skeleton-layout">
               <div className="skeleton skeleton-heading" />
@@ -520,7 +552,7 @@ export default function App() {
             </div>
           )}
           <footer className="main-footer">
-            <span>Made for your next chapter.</span>
+            <span>Your operations. One clear view.</span>
             <span>
               <ShieldCheck size={13} />
               Zupestore · INR · Asia/Kolkata
@@ -528,6 +560,19 @@ export default function App() {
           </footer>
         </main>
       </div>
+      <nav className="mobile-bottom-nav" aria-label="Quick navigation">
+        {[nav[0], nav[1], nav[6], nav[7]].map((item) => (
+          <button
+            key={item.id}
+            className={page === item.id ? 'active' : ''}
+            onClick={() => navigate(item.id)}
+            aria-current={page === item.id ? 'page' : undefined}
+          >
+            <item.icon size={21} />
+            <span>{item.id === 'rto' ? 'RTO credits' : item.label}</span>
+          </button>
+        ))}
+      </nav>
       {modal && data && (
         <ModalForms
           key={`${modal.type}-${modal.record && 'id' in modal.record ? modal.record.id : ''}`}

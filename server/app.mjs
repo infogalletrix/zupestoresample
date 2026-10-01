@@ -19,6 +19,9 @@ import {
   recordCredit,
   useCredit,
   recordPayment,
+  completePayment,
+  cancelPayment,
+  manualTransitions,
   createOrder,
   collectCod,
   today,
@@ -190,6 +193,7 @@ export function createApp(options = {}) {
     res.json({
       session: session(req),
       needsSetup: !db.prepare('SELECT id FROM users LIMIT 1').get(),
+      setupTokenRequired: !!process.env.SETUP_TOKEN,
     }),
   );
   const credentials = z.object({
@@ -272,7 +276,10 @@ export function createApp(options = {}) {
   app.get('/api/workspace', (req, res) => {
     const { from, to } = bounds(req);
     if (from > to) throw new AppError('Start date must be before the end date.');
-    res.json(workspace(req.db, from, to));
+    res.json({
+      ...workspace(req.db, from, to),
+      connections: req.auth.demo ? [] : integrations.publicConfig(),
+    });
   });
   app.post('/api/suppliers', write, (req, res) => {
     const d = schemas.supplier.parse(req.body);
@@ -338,10 +345,20 @@ export function createApp(options = {}) {
         .prepare('SELECT id FROM credit_ledger WHERE order_id=? LIMIT 1')
         .get(old.id);
       const hasSupplierPayment = req.db
-        .prepare("SELECT id FROM payments WHERE order_id=? AND kind='Supplier payment' LIMIT 1")
+        .prepare(
+          "SELECT id FROM payments WHERE order_id=? AND kind='Supplier payment' AND voided_at IS NULL LIMIT 1",
+        )
         .get(old.id);
-      if (hasCredits && d.status && d.status !== old.status)
-        throw new AppError('Status is locked after supplier credits are recorded.');
+      if (old.source === 'Manual' && d.status && d.status !== old.status) {
+        if (!manualTransitions[old.status]?.includes(d.status))
+          throw new AppError(
+            `Cannot change ${old.status} to ${d.status}. Completed deliveries and returns cannot be reversed.`,
+          );
+        if (d.status === 'Cancelled' && (hasCredits || hasSupplierPayment))
+          throw new AppError(
+            'Resolve supplier payments or credits before cancelling this purchase.',
+          );
+      }
       if (old.source === 'Shopify' && d.status && d.status !== old.status)
         throw new AppError('Synced order status is managed by Shopify and Shiprocket.');
       if (
@@ -418,11 +435,10 @@ export function createApp(options = {}) {
     res.status(201).json(recordPayment(req.db, req.body, req.auth.user.id)),
   );
   app.patch('/api/payments/:id/complete', write, (req, res) => {
-    const row = req.db.prepare('SELECT * FROM payments WHERE id=?').get(req.params.id);
-    if (!row) throw new AppError('Payment not found.', 404);
-    req.db.prepare("UPDATE payments SET status='Completed' WHERE id=?").run(row.id);
-    audit(req.db, req.auth.user.id, 'Payment completed', row.id);
-    res.json({ ok: true });
+    res.json(completePayment(req.db, req.params.id, req.body?.date, req.auth.user.id));
+  });
+  app.patch('/api/payments/:id/cancel', write, (req, res) => {
+    res.json(cancelPayment(req.db, req.params.id, req.body?.reason, req.auth.user.id));
   });
   app.post('/api/credits', write, (req, res) =>
     res.status(201).json(recordCredit(req.db, req.body, req.auth.user.id)),

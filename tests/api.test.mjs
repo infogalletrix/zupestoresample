@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createApp } from '../server/app.mjs';
 import { openDb, insert, id, now } from '../server/db.mjs';
-import { createOrder, today } from '../server/domain.mjs';
+import { createOrder, recordCredit, useCredit, today } from '../server/domain.mjs';
 import { hashPassword } from '../server/security.mjs';
 import ExcelJS from 'exceljs';
 const header = { 'X-Requested-With': 'CommerceWorkspace' };
@@ -304,4 +304,77 @@ test('disabled accounts immediately lose session access', async (t) => {
     .set(header)
     .send({ role: 'viewer', active: false })
     .expect(400);
+});
+
+test('using supplier credit still allows fulfilment; terminal delivery cannot be reversed', async (t) => {
+  const { app, db } = fixture(t),
+    agent = await owner(app);
+  insert(db, 'suppliers', { id: 'A', name: 'Supplier A', created_at: now() });
+  insert(db, 'products', {
+    id: 'P',
+    name: 'Product',
+    sku: 'P',
+    supplier_id: 'A',
+    cost: 10000,
+    price: 20000,
+    stock: 10,
+  });
+  const create = (status) =>
+    createOrder(
+      db,
+      {
+        date: today(),
+        customer: 'Customer',
+        method: 'COD',
+        status,
+        items: [{ product_id: 'P', quantity: 1, price: 20000 }],
+      },
+      'owner',
+    );
+  const returned = create('RTO'),
+    purchase = create('Confirmed');
+  recordCredit(
+    db,
+    {
+      supplier_id: 'A',
+      order_id: returned.id,
+      date: today(),
+      amount: 10000,
+      received: true,
+      reference: 'CREDIT',
+      idempotency_key: 'credit-fulfilment',
+    },
+    'owner',
+  );
+  useCredit(
+    db,
+    {
+      supplier_id: 'A',
+      order_id: purchase.id,
+      date: today(),
+      amount: 10000,
+      reference: 'PURCHASE',
+      idempotency_key: 'use-credit-fulfilment',
+    },
+    'owner',
+  );
+  const payload = (status) => ({ status, shipping_cost: 0, rto_cost: 0, notes: '', items: [] });
+  await agent.patch(`/api/orders/${purchase.id}`).set(header).send(payload('Shipped')).expect(200);
+  await agent
+    .patch(`/api/orders/${purchase.id}`)
+    .set(header)
+    .send(payload('Delivered'))
+    .expect(200);
+  await agent
+    .patch(`/api/orders/${purchase.id}`)
+    .set(header)
+    .send(payload('Cancelled'))
+    .expect(400);
+  await agent
+    .patch(`/api/orders/${purchase.id}`)
+    .set(header)
+    .send(payload('Confirmed'))
+    .expect(400);
+  assert.equal(db.prepare('SELECT stock FROM products WHERE id=?').get('P').stock, 8);
+  assert.equal(db.prepare("SELECT COUNT(*) n FROM payments WHERE kind='COD collected'").get().n, 1);
 });

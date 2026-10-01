@@ -62,8 +62,10 @@ export type Order = {
   method: string;
   status: string;
   total: number;
+  allowed_statuses?: string[];
   tax: number;
   shipping_cost: number;
+  shipping_verified?: number;
   rto_cost: number;
   source: string;
   notes: string;
@@ -103,6 +105,7 @@ export type Payment = {
   status: string;
   reference: string;
   source: string;
+  void_reason?: string;
 };
 export type Credit = {
   id: string;
@@ -149,6 +152,8 @@ export type SyncRun = {
   finished_at: string;
 };
 export type Workspace = {
+  connections?: Integration[];
+  paymentMetrics?: Pick<Metrics, 'codCollected' | 'codRemitted' | 'codPending' | 'prepaid'>;
   business: { name: string; currency: string; timezone: string };
   orders: Order[];
   products: Product[];

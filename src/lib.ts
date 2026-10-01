@@ -1,4 +1,12 @@
 import type { Period } from './types';
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    public status: number,
+  ) {
+    super(message);
+  }
+}
 export async function api<T = unknown>(path: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(`/api${path}`, {
     ...options,
@@ -9,8 +17,12 @@ export async function api<T = unknown>(path: string, options: RequestInit = {}):
     },
     credentials: 'same-origin',
   });
-  const body = await response.json();
-  if (!response.ok) throw new Error(body.error || 'Request failed. Please try again.');
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok)
+    throw new ApiError(
+      body.error || 'The server could not complete this request. Please try again.',
+      response.status,
+    );
   return body;
 }
 export const save = (path: string, data: unknown, method = 'POST') =>
@@ -53,6 +65,14 @@ export function makePeriod(label: string): Period {
   const today = localDate(),
     d = new Date(`${today}T12:00:00`);
   let from = today;
+  if (label === 'Yesterday') {
+    d.setDate(d.getDate() - 1);
+    return { label, from: fmt(d), to: fmt(d) };
+  }
+  if (label === 'Last 7 days') {
+    d.setDate(d.getDate() - 6);
+    from = fmt(d);
+  }
   if (label === 'Last 30 days') {
     d.setDate(d.getDate() - 29);
     from = fmt(d);

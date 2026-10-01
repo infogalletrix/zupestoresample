@@ -33,6 +33,8 @@ export function openDb(path) {
     ['orders', 'shipping_verified', 'INTEGER NOT NULL DEFAULT 0'],
     ['orders', 'shipping_override', 'INTEGER NOT NULL DEFAULT 0'],
     ['payments', 'tax_amount', 'INTEGER NOT NULL DEFAULT 0'],
+    ['payments', 'voided_at', 'TEXT'],
+    ['payments', 'void_reason', "TEXT NOT NULL DEFAULT ''"],
   ]) {
     if (
       !db

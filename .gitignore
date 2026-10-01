@@ -7,3 +7,5 @@ data/
 *.log
 artifacts/
 *.tsbuildinfo
+test-results/
+playwright-report/

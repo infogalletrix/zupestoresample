@@ -168,7 +168,7 @@ describe('daily-use screens', () => {
     const user = userEvent.setup();
     render(<App />);
     await user.click(await screen.findByRole('button', { name: /Explore demo workspace/ }));
-    await screen.findByRole('heading', { name: 'A clearer view. A better business.' });
+    await screen.findByRole('heading', { name: 'Your store, at a glance.' });
     await user.click(screen.getByRole('button', { name: /RTO refund balance/ }));
     expect(await screen.findByRole('heading', { name: 'RTO refund balance' })).toBeVisible();
     expect(screen.getByText('Available RTO balance')).toBeVisible();
@@ -254,9 +254,31 @@ describe('daily-use screens', () => {
     await user.click(screen.getByRole('button', { name: 'Next page' }));
     expect(screen.getByText('Order 06')).toBeVisible();
     await user.click(screen.getByRole('button', { name: 'Amount' }));
-    expect(screen.getByText('Order 07')).toBeVisible();
+    expect(screen.getByText('Order 12')).toBeVisible();
     fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Order 12' } });
     expect(screen.getByText('Order 12')).toBeVisible();
     expect(screen.queryByText('Order 01')).not.toBeInTheDocument();
   });
+});
+
+it('a search opened from another screen can be edited and cleared in the table', async () => {
+  const user = userEvent.setup();
+  render(
+    <DataTable
+      rows={[
+        { id: 'a', name: 'Alpha' },
+        { id: 'b', name: 'Beta' },
+      ]}
+      columns={[{ key: 'name', label: 'Name' }]}
+      search="Alpha"
+    />,
+  );
+  expect(screen.queryByText('Beta')).not.toBeInTheDocument();
+  await user.clear(screen.getByRole('textbox'));
+  await user.type(screen.getByRole('textbox'), 'Beta');
+  expect(screen.getByText('Beta')).toBeVisible();
+  expect(screen.queryByText('Alpha')).not.toBeInTheDocument();
+  await user.click(screen.getByRole('button', { name: 'Clear search' }));
+  expect(screen.getByText('Alpha')).toBeVisible();
+  expect(screen.getByText('Beta')).toBeVisible();
 });
