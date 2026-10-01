@@ -56,7 +56,8 @@ test('full backup restores records and encrypted connections, clears sessions an
     assert.equal(readdirSync(join(dir, 'backups')).filter((f) => f.endsWith('.zip')).length, 1);
   } finally {
     db.close();
-    if (!resolve(dir).startsWith(resolve(tmpdir()) + sep + 'zupestore-backup-test-')) throw new Error('Unexpected cleanup directory');
+    if (!resolve(dir).startsWith(resolve(tmpdir()) + sep + 'zupestore-backup-test-'))
+      throw new Error('Unexpected cleanup directory');
     rmSync(dir, { recursive: true, force: true });
   }
 });

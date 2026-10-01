@@ -42,6 +42,7 @@ export function openDb(path) {
     ['payments', 'shipping_deduction', 'INTEGER NOT NULL DEFAULT 0'],
     ['payments', 'rto_deduction', 'INTEGER NOT NULL DEFAULT 0'],
     ['payments', 'other_deduction', 'INTEGER NOT NULL DEFAULT 0'],
+    ['payments', 'settlement_awb', "TEXT NOT NULL DEFAULT ''"],
     ['webhook_events', 'next_attempt_at', 'TEXT'],
   ]) {
     if (

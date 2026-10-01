@@ -222,11 +222,22 @@ function evaluate(db, row) {
   const order = matchOrder(db, row);
   if (!row.completed)
     return { status: 'Pending', message: 'The provider has not confirmed this payment.', order };
-  const prior = db
+  const references = db
     .prepare(
       "SELECT * FROM payments WHERE order_id=? AND kind='COD remittance' AND reference=? AND voided_at IS NULL",
     )
-    .get(order.id, row.reference);
+    .all(order.id, row.reference);
+  // One bank payout may contain two separate AWB allocations for the same order.
+  // A row without an AWB cannot safely be matched to either allocation.
+  if (
+    references.some(
+      (p) => (p.settlement_awb || '') !== (row.awb || '') && (!p.settlement_awb || !row.awb),
+    )
+  )
+    throw new AppError(
+      'This bank reference already has an allocation without a matching AWB. Review its order-level payment before posting.',
+    );
+  const prior = references.find((p) => (p.settlement_awb || '') === (row.awb || ''));
   if (prior) {
     if (prior.amount !== row.gross || prior.date !== row.date || prior.status !== 'Completed')
       throw new AppError(
@@ -379,6 +390,7 @@ function postRow(db, rowId, row, actor) {
           shipping_deduction: row.shipping,
           rto_deduction: row.rto,
           other_deduction: row.other,
+          settlement_awb: row.awb,
           status: 'Completed',
           reference: row.reference,
           source: 'Shiprocket report',

@@ -219,3 +219,29 @@ test('partial settlements cannot deduct the same shipping cost twice', (t) => {
   assert.equal(importRows(db, [partial]).posted, 1);
   assert.equal(importRows(db, [{ ...partial, UTR: 'SECOND-PAYOUT' }]).review, 1);
 });
+
+test('one UTR can allocate two distinct shipment payouts without losing or duplicating money', (t) => {
+  const { db, order, row } = fixture(t);
+  insert(db, 'shipments', {
+    id: id(),
+    order_id: order.id,
+    awb: 'SECOND-AWB',
+    status: 'Delivered',
+    updated_at: now(),
+    status_at: now(),
+  });
+  const first = {
+    ...row,
+    'COD Amount': '500',
+    'Bank Amount': '500',
+    'Settlement Fees': '0',
+    'Shipping Deduction': '0',
+  };
+  const second = { ...first, AWB: 'SECOND-AWB' };
+  assert.equal(importRows(db, [first, second]).posted, 2);
+  assert.equal(importRows(db, [first, second]).duplicate, 2);
+  const data = workspace(db);
+  assert.equal(data.metrics.codPending, 0);
+  assert.equal(data.paymentMetrics.bankReceived, 100000);
+  assert.equal(importRows(db, [{ ...first, AWB: '' }]).review, 1);
+});
